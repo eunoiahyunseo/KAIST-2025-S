@@ -1,17 +1,17 @@
 
 out_dir = './output/graph'
-ckpt_path = './output/graph/knu-prmi-org_base/best_ckpt.pt'
+ckpt_path = './output/graph/knu-prmi-org_graph_dfm/best_ckpt.pt'
 data_dir = './data/graph'
 
 run_name = 'base'
 
 dataset = 'graph'
 batch_size = 10
-block_size = 400 # context of up to 256 previous characters
+block_size = 625 # context of up to 256 previous characters
 
-n_layer = 6
-n_head = 6
-n_embd = 768
+n_layer = 12
+n_head = 16
+n_embd = 1024
 dropout = 0.0
 qk_layernorm = True
 do_x1_sc = True

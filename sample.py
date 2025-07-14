@@ -247,7 +247,10 @@ with torch.no_grad():
         
             for sample_idx in range(samples_np.shape[0]):
                 with open(os.path.join(samples_dir, 'samples.txt'), 'a') as f:
-                    f.write(str(samples_np[sample_idx]) + '\n')
+                    sample_line = ' '.join(map(str, samples_np[sample_idx]))
+                    f.write(sample_line + '\n')
+                    print(f'Sample {sample_idx + 1}/{samples_np.shape[0]} written to file.')
+        print('All samples have been written to file.')
 
 with open(os.path.join(samples_dir, 'finished_sampling.txt'), 'w') as f:
     f.write('finished sampling\n')

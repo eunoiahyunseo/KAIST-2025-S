@@ -218,6 +218,7 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 
 def get_batch(split, times=None):
     data = train_data if split == 'train' else val_data
+    # print(data.shape)
     if not overfit_batch:
         ix = torch.randint(len(data) - block_size, (batch_size,)) # start index
     else:
@@ -401,14 +402,6 @@ while True:
 
         X, target_mask = corrupt_data(X, times)
 
-        """
-        시간축 →
-        GPU: [Forward Pass ████████] [Backward Pass ████]
-            |                    |                    |
-        CPU: [Batch N 준비] [Batch N+1 로딩 ████] [Batch N+2 준비]
-            |            |                  |
-            현재 배치    다음 배치 prefetch  그 다음 배치
-        """
         # start forward pass in GPU
         with ctx:
             logits, loss = model(X, times, Y, target_mask, do_self_conf_loop=do_self_conf_loop)

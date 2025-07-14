@@ -97,7 +97,7 @@ if __name__ == "__main__":
     train_tokens, val_tokens, meta = npz_to_bin(
         '/home/hyunseo/workspace/KAIST-2025-S/discrete_model_testbed/data/graph/graph_dataset.npz', 
         '/home/hyunseo/workspace/KAIST-2025-S/discrete_model_testbed/data/graph/',
-        split_ratio=0.9
+        split_ratio=0.8
     )
     
     # 결과 검증
