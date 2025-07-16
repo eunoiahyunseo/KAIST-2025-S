@@ -1,7 +1,4 @@
 """
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
 modified with: eunoia_hyunseo heart2002101@knu.ac.kr
 """
 
@@ -21,6 +18,13 @@ from torch.distributed import init_process_group, destroy_process_group
 from pathlib import Path
 
 from flow_model import GPT, GPTConfig
+
+# Flow Matching imports
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.solver import MixtureDiscreteEulerSolver
+from flow_matching.utils import ModelWrapper
+from flow_matching.loss import MixturePathGeneralizedKL
 
 # -----------------------------------------------------------------------------
 # these values will be overridden by the config file so their values here don't matter.
@@ -136,15 +140,9 @@ else:
     ddp_world_size = 1
 
 shared_generator = torch.Generator(device).manual_seed(42) # for use when we want the random numbers to be the same across processes
-
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-# if master_process and resume_dir is not None:
-#     os.makedirs(out_dir, exist_ok=True)
-#     with open(os.path.join(out_dir, 'config.yaml'), 'w') as f:
-#         yaml.dump(config, f, sort_keys=False)
 
 torch.manual_seed(1337 + seed_offset + bonus_seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -178,12 +176,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   bias=bias, vocab_size=None, dropout=dropout, qk_layernorm=qk_layernorm,
                   do_x1_sc=do_x1_sc, mask_token_id=mask_token_id, proper_timestep_emb=proper_timestep_emb,
                   d3pm_loss_weighting=d3pm_loss_weighting, d3pm_loss_weighting_maxT=d3pm_loss_weighting_maxT)
-
-# init a new model from scratch
-print("Initializing a new model from scratch")
-# determine the vocab size we'll use for from-scratch training
-if meta_vocab_size is None:
-    print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    
 model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
@@ -192,15 +185,55 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
-# compile the model
-# if compile:
-#     print("compiling the model... (takes a ~minute)")
-#     unoptimized_model = model
-#     model = torch.compile(model) # requires PyTorch 2.0
+# Flow Matching setup
+class FlowMatchingModelWrapper(ModelWrapper):
+    """Wrapper for GPT model to work with Flow Matching framework"""
+    def __init__(self, gpt_model):
+        super().__init__(gpt_model)
+        self.gpt_model = gpt_model
+    
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
+        """
+        Forward pass for Flow Matching
+        Args:
+            x: input tokens, shape (batch_size, seq_len)
+            t: time, shape (batch_size,)
+        Returns:
+            logits: output logits, shape (batch_size, seq_len, vocab_size)
+        """
+        # Convert time to proper shape for GPT model
+        # t_expanded = t.unsqueeze(-1).expand(-1, x.shape[1])  # (batch_size, seq_len)
+        logits, _ = self.gpt_model(x, t)
+        return logits
 
-# wrap model into DDP container
+# Initialize Flow Matching components
+scheduler = PolynomialConvexScheduler(n=1.0)  # Linear scheduler
+prob_path = MixtureDiscreteProbPath(scheduler=scheduler)
+wrapped_model = FlowMatchingModelWrapper(model)
+solver = MixtureDiscreteEulerSolver(
+    model=wrapped_model,
+    path=prob_path,
+    vocabulary_size=meta_vocab_size
+)
+
+# Flow Matching loss function
+flow_loss_fn = MixturePathGeneralizedKL(path=prob_path)
+
+def corrupt_data_flow_matching(x_0, x_1, times):
+    """
+    Flow Matching data corruption using MixtureDiscreteProbPath
+    Args:
+        x_0: source data (usually masked/random)
+        x_1: target data (clean data)  
+        times: time values
+    Returns:
+        path_sample: sampled intermediate states
+    """
+    path_sample = prob_path.sample(x_0=x_0, x_1=x_1, t=times)
+    return path_sample
 
 def corrupt_data(data, times):
+    """Legacy corruption for d3pm compatibility"""
     b = times.shape[0]
     t = data.shape[1]
 
@@ -212,27 +245,23 @@ def corrupt_data(data, times):
     data[target_mask] = mask_token_id # random masking
     return data, target_mask
 
-# poor man's data loader
+# data loader
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 def get_batch(split, times=None):
     data = train_data if split == 'train' else val_data
-    # print(data.shape)
+
     if not overfit_batch:
         ix = torch.randint(len(data) - block_size, (batch_size,)) # start index
     else:
         ix = torch.zeros((batch_size,), dtype=torch.int64)
+        
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    # y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).asㅁtype(np.int64)) for i in ix])
+    
     if times is None:
-        if model_type == 'flow':
-            times = torch.rand((batch_size,)) * (1.0 - min_t) + min_t
-        elif model_type == 'd3pm':
-            times = torch.randint(low=1, high=timesteps+1, size=(batch_size,)).float()
-        else:
-            raise ValueError(f'Unknown model type {model_type}')
+        times = torch.rand((batch_size,)) * (1.0 - min_t) + min_t
     else:
         assert times.shape == (batch_size,)
 
@@ -247,15 +276,22 @@ def get_batch(split, times=None):
 
 
 def calc_loss(X, Y, times, target_mask, infill_probs, num_ones_in_mask):
-    if model_type == 'flow':
-        logits, loss = model(X, times, Y, target_mask)
-    elif model_type == 'd3pm':
-        logits, loss = model(X, times.float()/timesteps, Y, target_mask)
-    else:
-        raise ValueError(f'Unknown model type {model_type}')
-
+    # Use Flow Matching framework
+    # Sample from probability path
+    path_sample = prob_path.sample(x_0=X, x_1=Y, t=times)
+    
+    # Get model predictions
+    logits = wrapped_model(path_sample.x_t, times)
+    
+    # Compute Flow Matching loss
+    loss = flow_loss_fn(
+        logits=logits,
+        x_t=path_sample.x_t,
+        x_1=path_sample.x_1,
+        t=times
+    )
+    
     return loss
-
 
 
 
@@ -268,14 +304,11 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y, times = get_batch(split)
-            if model_type == 'flow':
-                X, target_mask = corrupt_data(X, times)
-                with ctx:
-                    loss = calc_loss(X, Y, times, target_mask, None, None)
-            elif model_type == 'd3pm':
-                X, target_mask = corrupt_data(X, times)
-                with ctx:
-                    loss = calc_loss(X, Y, times, target_mask, None, None)
+            
+            # Create source data (masked version)
+            X_source = torch.full_like(X, mask_token_id)  # Start from all mask tokens
+            with ctx:
+                loss = calc_loss(X_source, Y, times, None, None, None)
 
             losses[k] = loss.item()
         out[split] = losses.mean() # train/val loss
@@ -295,6 +328,37 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
+
+
+# @torch.no_grad()
+# def sample_from_flow_model(num_samples=1, seq_length=None, num_steps=50):
+#     """
+#     Sample from the trained Flow Matching model
+#     Args:
+#         num_samples: number of sequences to generate
+#         seq_length: length of sequences (default: block_size)
+#         num_steps: number of diffusion steps
+#     Returns:
+#         generated sequences
+#     """
+#     if seq_length is None:
+#         seq_length = block_size
+        
+#     model.eval()
+    
+#     # Start from all mask tokens
+#     x_init = torch.full((num_samples, seq_length), mask_token_id, device=device)
+    
+#     # Sample using the solver
+#     samples = solver.sample(
+#         x_init=x_init,
+#         step_size=1.0/num_steps,
+#         return_intermediates=False,
+#         verbose=True
+#     )
+    
+#     model.train()
+#     return samples
 
 
 # logging
@@ -330,38 +394,34 @@ while True:
                 times = 0.85 * torch.ones((batch_size,))
 
                 X, Y, times = get_batch('train', times)
-                X, target_mask = corrupt_data(X, times)
+                
+                X_source = torch.full_like(X, mask_token_id)
                 with torch.no_grad():
                     print("running forward pass for logging...")
-                    logits, _ = model(X, times) # (B, T, V)
-
-
+                    # Sample from path for visualization
+                    path_sample = prob_path.sample(x_0=X_source, x_1=Y, t=times)
+                    logits = wrapped_model(path_sample.x_t, times)  # (B, T, V)
+                    
                 predictions = torch.argmax(logits, dim=-1)
                 samples = torch.multinomial(torch.softmax(logits, dim=-1).view(-1, meta_vocab_size), num_samples=1)[:, 0].view(batch_size, -1)
-
-                # calculate accuracy
-                matches = (samples == Y) # (B, T)
-                acc = (matches * target_mask).sum().float() / target_mask.sum()
-
-                first_pred_idx = torch.argmax(target_mask[0].float())
-                zero_logit = logits[0, first_pred_idx, 0]
-                one_logit = logits[0, first_pred_idx, 1]
-                two_logit = logits[0, first_pred_idx, 2]
-                predictions[~target_mask] = X[~target_mask]
-                samples[~target_mask] = X[~target_mask]
+                
+                # Calculate accuracy on the intermediate state
+                matches = (samples == Y)  # (B, T)
+                acc = matches.float().mean()
+                
+                # Get some token logits for monitoring
+                first_logit_0 = logits[0, 0, 0]
+                first_logit_1 = logits[0, 0, 1] if meta_vocab_size > 1 else torch.tensor(0.0)
+                first_logit_2 = logits[0, 0, 2] if meta_vocab_size > 2 else torch.tensor(0.0)
+                    
                 wandb.log({
                     "iter": iter_num,
                     "train/loss": losses['train'],
                     "val/loss": losses['val'],
                     "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                    # "clean" : decode(Y[0].cpu().numpy()),
-                    # "corrupted" : decode(X[0].cpu().numpy()),
-                    # "argmax_recon" : decode(predictions[0].cpu().numpy()),
-                    # "sample_recon" : decode(samples[0].cpu().numpy()),
-                    "zero_logit": zero_logit,
-                    "one_logit": one_logit,
-                    "two_logit": two_logit,
+                    "first_logit_0": first_logit_0,
+                    "first_logit_1": first_logit_1,
+                    "first_logit_2": first_logit_2,
                     "acc": acc,
                 }, step=iter_num)
             except Exception as e:
@@ -377,8 +437,6 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                # print(f"saving checkpoint to {out_dir}")
-                # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
                 print(f"saving checkpoint to {file_path}")
                 torch.save(checkpoint, file_path)
 
@@ -388,9 +446,7 @@ while True:
             best_val_loss = losses['val']
             save_checkpoint(os.path.join(out_dir, 'best_ckpt.pt'))
 
-    if iter_num == 0 and eval_only:
-        break
-
+    # decide whether to do self-conditioning loop
     if do_x1_sc and torch.rand(1, generator=shared_generator, device=device) < x1_sc_prob:
         do_self_conf_loop = True
     else:
@@ -399,12 +455,11 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-
-        X, target_mask = corrupt_data(X, times)
-
+        # Flow Matching approach - use clean source/target pairs
+        X_source = torch.full_like(X, mask_token_id)  # Start from all mask tokens
         # start forward pass in GPU
         with ctx:
-            logits, loss = model(X, times, Y, target_mask, do_self_conf_loop=do_self_conf_loop)
+            loss = calc_loss(X_source, Y, times, None, None, None)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
         # while gpu forward pass, cpu can prepare the next batch
@@ -417,33 +472,28 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+        
+
     scaler.step(optimizer)
     scaler.update()
-
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
+
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         try:
             wandb.log({"train/iter_loss": lossf}, step=iter_num)
         except Exception as e:
             print(e)
+            
+            
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
     if iter_num > max_iters:
         break
 

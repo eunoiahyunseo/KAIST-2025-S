@@ -62,6 +62,11 @@ ckpt_path = 'out/ckpt.pt'
 # d3pm settings
 timesteps = 1000
 
+# Flow Matching sampling settings
+num_flow_steps = int(max_t / dt)  # Number of discretization steps
+div_free = 0.0  # Divergence-free component
+dtype_categorical = torch.float32  # Precision for categorical sampling
+return_intermediates = False  # Whether to return intermediate states
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -82,6 +87,12 @@ with open(os.path.join(samples_dir, f'run_name_{run_name}.txt'), 'w') as f:
 
 
 from flow_model import GPT, GPTConfig
+
+# Flow Matching imports
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.solver import MixtureDiscreteEulerSolver
+from flow_matching.utils import ModelWrapper
 
 # attempt to derive vocab_size from the dataset
 data_dir = os.path.join('data', dataset)
@@ -140,6 +151,44 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model) # requires PyTorch 2.0
 
+# Flow Matching setup
+class FlowMatchingModelWrapper(ModelWrapper):
+    """Wrapper for GPT model to work with Flow Matching framework"""
+    def __init__(self, gpt_model):
+        super().__init__(gpt_model)
+        self.gpt_model = gpt_model
+    
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
+        """
+        Forward pass for Flow Matching
+        Args:
+            x: input tokens, shape (batch_size, seq_len)
+            t: time, shape (batch_size,)
+        Returns:
+            logits: output logits, shape (batch_size, seq_len, vocab_size)
+        """
+        # Convert time to proper shape for GPT model
+        # t_expanded = t.unsqueeze(-1).expand(-1, x.shape[1])  # (batch_size, seq_len)
+        logits, _ = self.gpt_model(x, t)
+        logits = torch.softmax(logits, dim=-1)
+
+        return logits
+
+
+class WrappedModel(ModelWrapper):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras):
+        return torch.softmax(self.model(x, t), dim=-1)
+    
+    
+scheduler = PolynomialConvexScheduler(n=1.0)  # Linear scheduler
+prob_path = MixtureDiscreteProbPath(scheduler=scheduler)
+wrapped_probability_denoiser = FlowMatchingModelWrapper(model)
+solver = MixtureDiscreteEulerSolver(
+    model=wrapped_probability_denoiser,
+    path=prob_path,
+    vocabulary_size=meta_vocab_size
+)
+
 
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -150,7 +199,6 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # ----------------- SAMPLING CODE --------------=-
 
 S = meta_vocab_size
-
 B = batch_size
 D = block_size
 
@@ -160,96 +208,74 @@ with open(os.path.join(samples_dir, 'samples.txt'), 'w') as f:
 
 assert total_samples % B == 0
 
-
 with torch.no_grad():
     with ctx:
-
-        mask_one_hot = torch.zeros((S,), device=device)
-        mask_one_hot[mask_token_id] = 1.0
-
-
-        for _ in range(total_samples // B):
+        for batch_idx in range(total_samples // B):
+            print(f"Processing batch {batch_idx + 1}/{total_samples // B}")
 
             if model_type == 'flow':
-                samples = mask_token_id * torch.ones((B, D), device=device, dtype=torch.long)
-
-                if model.config.do_x1_sc:
-                    x1_sc = model.config.mask_token_id * torch.ones_like(samples)
-
-                t = 0.0
-                while True: 
-
-                    model_input_samples = samples
-
-                    if not model.config.do_x1_sc:
-                        logits, _ = model(model_input_samples, t * torch.ones((B,), device=device)) # (B, T, V)
-                    else:
-                        logits = model._run_net(model_input_samples, t * torch.ones((B,), device=device), x1=x1_sc)
-
-                    # [mask token mask] -> [logits(mask_1), -1e9, logits(mask_2)]
-                    masked_logits = logits * (samples == mask_token_id).view(B, D, 1).float() + \
-                        -1e9 * (samples != mask_token_id).view(B, D, 1).float()
-
-                    max_masked_logits = torch.max(masked_logits, dim=-1)[0] # (B, T)
-                    purity_weights = torch.softmax(max_masked_logits/purity_temp, dim=-1) # (B, T)
-
-                    pt_x1_probs = F.softmax(logits / x1_temp, dim=-1) # (B, D, S)
-
-                    if use_different_x1_sc_temp:
-                        pt_sc_x1_probs = F.softmax(logits / x1_sc_temp, dim=-1) # (B, D, S)
-                    else:
-                        pt_sc_x1_probs = pt_x1_probs
-
-
-                    if model.config.do_x1_sc:
-                        x1_sc = torch.multinomial(pt_sc_x1_probs.view(B*D, S), num_samples=1).view(B, D).long()
-                    if ignore_x1_sc:
-                        x1_sc = model.config.mask_token_id * torch.ones_like(samples)
-
-                    sample_is_mask = (samples == mask_token_id).view(B, D, 1).float()
-
-                    # for when the current sample is a mask
-                    step_probs = dt * pt_x1_probs * ((1+ noise*t) / ((1 - t))) # (B, D, S)
-                    if do_purity_sampling:
-                        step_probs = step_probs * sample_is_mask * purity_weights.view(B, D, 1) * torch.sum(sample_is_mask, dim=(1,2)).view(B, 1, 1)
-                    else:
-                        step_probs = step_probs * sample_is_mask
-
-                    # when the current sample is not a mask
-                    step_probs += dt * (1 - sample_is_mask) * mask_one_hot.view(1, 1, -1) * noise
-
-
-                    step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
-                    step_probs[
-                        torch.arange(B, device=device).repeat_interleave(D),
-                        torch.arange(D, device=device).repeat(B),
-                        samples.flatten()
-                    ] = 0.0
-                    step_probs[
-                        torch.arange(B, device=device).repeat_interleave(D),
-                        torch.arange(D, device=device).repeat(B),
-                        samples.flatten()
-                    ] = 1.0 - torch.sum(step_probs, dim=-1).flatten()
-                    step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
-                    samples = torch.multinomial(step_probs.view(-1, S), num_samples=1).view(B, D)
-
-                    t += dt
-                    if t > max_t:
-                        break
-
+                # Initialize with mask tokens (source distribution)
+                x_init = torch.full((B, D), mask_token_id, device=device, dtype=torch.long)
+                
+                print(f"Sampling using Flow Matching solver with {num_flow_steps} steps...")
+                print(f"Step size: {dt}, Max time: {max_t}")
+                
+                # Use Flow Matching solver for sampling
+                if return_intermediates:
+                    # Define time grid for intermediate sampling
+                    time_grid = torch.linspace(0.0, max_t, steps=10, device=device)
+                    samples = solver.sample(
+                        x_init=x_init,
+                        step_size=dt,
+                        div_free=div_free,
+                        dtype_categorical=dtype_categorical,
+                        time_grid=time_grid,
+                        return_intermediates=True,
+                        verbose=True
+                    )
+                    
+                    # Save intermediate states if needed
+                    print(f"Intermediate samples shape: {samples.shape}")
+                    samples = samples[-1]  # Take final samples
+                else:
+                    samples = solver.sample(
+                        x_init=x_init,
+                        step_size=dt,
+                        div_free=div_free,
+                        dtype_categorical=dtype_categorical,
+                        return_intermediates=False,
+                        verbose=True
+                    )
+                
+                print(f"Sampling completed. Final samples shape: {samples.shape}")
+                
+                # Apply final argmax if requested
                 if argmax_final:
-                    sample_is_mask = (samples == mask_token_id).view(B, D).float()
-                    with torch.no_grad():
-                        logits, _ = model(samples, t * torch.ones((B,), device=device)) # (B, T, V)
-                    samples = torch.argmax(logits, dim=-1) * sample_is_mask + samples * (1 - sample_is_mask)
+                    print("Applying final argmax to remaining mask tokens...")
+                    # Get final predictions
+                    t_final = torch.ones((B,), device=device) * max_t
+                    logits = wrapped_probability_denoiser(samples, t_final)
+                    
+                    # Only update positions that are still mask tokens
+                    sample_is_mask = (samples == mask_token_id).float()
+                    num_remaining_masks = sample_is_mask.sum().item()
+                    print(f"Remaining mask tokens: {num_remaining_masks}/{B*D}")
+                    
+                    if num_remaining_masks > 0:
+                        argmax_samples = torch.argmax(logits, dim=-1)
+                        samples = (argmax_samples * sample_is_mask + 
+                                  samples * (1 - sample_is_mask)).long()
 
                 samples_np = samples.cpu().detach().numpy() # (B, D)
-        
+                
+            # Save samples to file
             for sample_idx in range(samples_np.shape[0]):
                 with open(os.path.join(samples_dir, 'samples.txt'), 'a') as f:
                     sample_line = ' '.join(map(str, samples_np[sample_idx]))
                     f.write(sample_line + '\n')
-                    print(f'Sample {sample_idx + 1}/{samples_np.shape[0]} written to file.')
+                    
+            print(f'Batch {batch_idx + 1} completed: {samples_np.shape[0]} samples written to file.')
+        
         print('All samples have been written to file.')
 
 with open(os.path.join(samples_dir, 'finished_sampling.txt'), 'w') as f:
