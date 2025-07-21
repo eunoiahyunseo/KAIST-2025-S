@@ -31,7 +31,7 @@ class MixturePathGeneralizedKL(_Loss):
         super().__init__(None, None, reduction)
         self.path = path
 
-    def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, t: Tensor) -> Tensor:
+    def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, t: Tensor, attention_mask: Tensor) -> Tensor:
         r"""Evaluates the generalized KL loss.
 
         Args:
@@ -48,11 +48,19 @@ class MixturePathGeneralizedKL(_Loss):
         """
         x_1_shape = x_1.shape 
 
+        valid_mask = x_1 != 258
+
+        # x_1 = _coordinate_transform(x_1)
+        # x_t = _coordinate_transform(x_t)
+
+
         # extract x_1 value of log(p_{1|t}(x|x_t)).
-        # x1 (b, t) 
         log_p_1t = torch.log_softmax(logits, dim=-1) # (b, t, v)
         log_p_1t_x1 = torch.gather(log_p_1t, dim=-1, index=x_1.unsqueeze(-1)) # (b, t, 1)
         log_p_1t_x1 = log_p_1t_x1.view(*x_1_shape) # (b, t): the probability of target token in each position i
+        # x_t_modified = x_t.clone()
+        # x_t_modified[~(attention_mask.to(torch.bool))] = 258  # Set x_t to 258 where attention_mask is False
+        # print('x_t_modified.shape', x_t_modified.shape, x_t_modified[0])
 
         # extract x_t value of p_{1|t}(x|x_t).
         p_1t = torch.exp(log_p_1t)
@@ -60,8 +68,6 @@ class MixturePathGeneralizedKL(_Loss):
         p_1t_xt = p_1t_xt.view(*x_1_shape)
 
         scheduler_output = self.path.scheduler(t)
-
-
         
         """
             scheduler_output.d_alpha_t: (b, )
@@ -77,6 +83,7 @@ class MixturePathGeneralizedKL(_Loss):
 
         jump_coefficient = jump_coefficient.repeat(1, *x_1_shape[1:])
         # if position where x_t, x_1 is same 1, otherwise 0
+        # Use original x_1 and x_t for delta calculation (not the safe versions)
         delta_x1_xt = (x_t == x_1).to(log_p_1t.dtype)
 
         # maximize the (1-delta_x1_xt) * log_p_1t_x1
@@ -84,9 +91,14 @@ class MixturePathGeneralizedKL(_Loss):
         loss = -jump_coefficient * (
             p_1t_xt - delta_x1_xt + (1 - delta_x1_xt) * log_p_1t_x1
         )
+        # print('valid_mask.shape', valid_mask.shape)
+
+        loss = loss * valid_mask
 
         if self.reduction == "mean":
-            return torch.mean(loss)
+            # print('loss.shape', loss.shape)
+            return loss.mean()
+            
         elif self.reduction == "sum":
             return torch.sum(loss)
         elif self.reduction == "none":

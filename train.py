@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from pathlib import Path
+from torch import nn, Tensor
 
 from flow_model import GPT, GPTConfig
 
@@ -35,6 +36,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -97,10 +99,7 @@ bonus_seed_offset = 0
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and (isinstance(v, (int, float, bool, str)) or v is None) ]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------import os
-
-
-assert model_type in ['flow', 'd3pm']
+# -----------------------------------------------------------------------------
 
 if resume_dir is None:
     if wandb_id == 'blank':
@@ -116,35 +115,8 @@ else:
 assert (resume_dir is not None) == is_repeat
 
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    print("ddp run")
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
-else:
-    print("not ddp run")
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
-
 shared_generator = torch.Generator(device).manual_seed(42) # for use when we want the random numbers to be the same across processes
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-torch.manual_seed(1337 + seed_offset + bonus_seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -163,21 +135,40 @@ with open(meta_path, 'r') as f:
 meta_vocab_size = meta['vocab_size']
 
 print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    
+# add mask_token 
+eos_token_id = meta_vocab_size # 256
 
-mask_token_id = meta_vocab_size - 1
+if dataset == 'sketch':
+    meta_vocab_size += 1
+    # add eos token
+    mask_token_id = meta_vocab_size # 257
+
+    meta_vocab_size += 1
+    # add padding token    
+    padding_token_id = meta_vocab_size # 258
+    
+    meta_vocab_size += 1 # total token
 
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
+iter_num = 1
 best_val_loss = 1e9
+if dataset == 'sketch':
+    use_coordinate_embedding = True
+    n_embd = n_embd * 2
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, qk_layernorm=qk_layernorm,
-                  do_x1_sc=do_x1_sc, mask_token_id=mask_token_id, proper_timestep_emb=proper_timestep_emb,
-                  d3pm_loss_weighting=d3pm_loss_weighting, d3pm_loss_weighting_maxT=d3pm_loss_weighting_maxT)
+                  do_x1_sc=do_x1_sc, proper_timestep_emb=proper_timestep_emb,
+                  d3pm_loss_weighting=d3pm_loss_weighting, d3pm_loss_weighting_maxT=d3pm_loss_weighting_maxT, use_coordinate_embedding=use_coordinate_embedding,
+                  eos_token_id=eos_token_id, mask_token_id=mask_token_id, pad_token_id=padding_token_id)
+
     
+
 model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+model_args
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
 model.to(device)
@@ -185,117 +176,202 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
-# Flow Matching setup
-class FlowMatchingModelWrapper(ModelWrapper):
-    """Wrapper for GPT model to work with Flow Matching framework"""
-    def __init__(self, gpt_model):
-        super().__init__(gpt_model)
-        self.gpt_model = gpt_model
-    
-    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
-        """
-        Forward pass for Flow Matching
-        Args:
-            x: input tokens, shape (batch_size, seq_len)
-            t: time, shape (batch_size,)
-        Returns:
-            logits: output logits, shape (batch_size, seq_len, vocab_size)
-        """
-        # Convert time to proper shape for GPT model
-        # t_expanded = t.unsqueeze(-1).expand(-1, x.shape[1])  # (batch_size, seq_len)
-        logits, _ = self.gpt_model(x, t)
+class WrappedModel(ModelWrapper):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, attention_mask=None, **extras):
+        logits = self.model._run_net(idx=x, time=t, attn_mask=attention_mask)
         return logits
+        
 
-# Initialize Flow Matching components
-scheduler = PolynomialConvexScheduler(n=1.0)  # Linear scheduler
+scheduler = PolynomialConvexScheduler(n=1.0) 
 prob_path = MixtureDiscreteProbPath(scheduler=scheduler)
-wrapped_model = FlowMatchingModelWrapper(model)
-solver = MixtureDiscreteEulerSolver(
-    model=wrapped_model,
-    path=prob_path,
-    vocabulary_size=meta_vocab_size
-)
+wrapped_probability_denoiser = WrappedModel(model)
 
-# Flow Matching loss function
 flow_loss_fn = MixturePathGeneralizedKL(path=prob_path)
 
-def corrupt_data_flow_matching(x_0, x_1, times):
+if dataset == 'graph':
+    # data loader
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+if dataset == 'sketch':
+    # data loader
+    train_data = np.load(os.path.join(data_dir, 'train.npz'), allow_pickle=True)
+    val_data = np.load(os.path.join(data_dir, 'val.npz'), allow_pickle=True)
+
+
+def _coordinate_transform(idx, padding_token=None, eos_token=None):
     """
-    Flow Matching data corruption using MixtureDiscreteProbPath
-    Args:
-        x_0: source data (usually masked/random)
-        x_1: target data (clean data)  
-        times: time values
-    Returns:
-        path_sample: sampled intermediate states
+    좌표 데이터를 [x1, y1, x2, y2, eos, eos, pad, pad, pad, pad] 형태에서 [(x1, x2, eos, pad, pad), (y1, y2, eos, pad, pad)] 형태로 변환
+    idx: (batch_size, seq_len) - interleaved x,y coordinates with padding
     """
-    path_sample = prob_path.sample(x_0=x_0, x_1=x_1, t=times)
-    return path_sample
+    b, t = idx.size()
+    padding_token = 258
+    eos_token = 256 # 257
+    
+    transformed_list = []
+    transformed_attn_mask = []
+    
+    for batch_idx in range(b):
+        sequence = idx[batch_idx]
+        num_eos = 2
+        non_pad_tokens = sequence[sequence != padding_token]
+        
+        num_coords = len(non_pad_tokens) - num_eos # not include (eos), (pad) tokens
+        num_pads = t - len(non_pad_tokens)
 
-def corrupt_data(data, times):
-    """Legacy corruption for d3pm compatibility"""
-    b = times.shape[0]
-    t = data.shape[1]
+        x_coords = non_pad_tokens[0:num_coords//2].tolist() + [eos_token] + [padding_token] * (num_pads // 2)
+        y_coords = non_pad_tokens[num_coords//2:num_coords].tolist() + [eos_token] + [padding_token] * (num_pads // 2)
+        transformed_x_attn_mask = [1] * (len(x_coords) - (num_pads // 2) - 1) + [2] + [0] * (num_pads // 2)
+        transformed_y_attn_mask = [1] * (len(y_coords) - (num_pads // 2) - 1) + [2] + [0] * (num_pads // 2)
+        transformed_list.append(x_coords + y_coords)
+        transformed_attn_mask.append(transformed_x_attn_mask + transformed_y_attn_mask)
 
-    assert times.shape == (b,)
-    assert data.shape == (b, t)
+    return torch.tensor(transformed_list).to(idx.device), torch.tensor(transformed_attn_mask).to(idx.device)
 
-    u = torch.rand((batch_size, block_size), device=times.device)
-    target_mask = u < (1.0 - times.view(batch_size, 1))
-    data[target_mask] = mask_token_id # random masking
-    return data, target_mask
-
-# data loader
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 def get_batch(split, times=None):
     data = train_data if split == 'train' else val_data
-
-    if not overfit_batch:
-        ix = torch.randint(len(data) - block_size, (batch_size,)) # start index
-    else:
-        ix = torch.zeros((batch_size,), dtype=torch.int64)
-        
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     
+    if dataset == 'text8':
+        if not overfit_batch:
+            ix = torch.randint(len(data) - block_size, (batch_size,)) # start index
+        else:
+            ix = torch.zeros((batch_size,), dtype=torch.int64)
+        x_1 = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        
+    elif dataset == 'sketch':
+        # NPZ 데이터에서 랜덤하게 키 선택
+        data_keys = list(data.files)
+        
+        if not overfit_batch:
+            # 랜덤하게 batch_size만큼 키 선택
+            selected_keys = np.random.choice(data_keys, size=batch_size, replace=True)
+        else:
+            # overfit_batch일 때는 같은 키들을 반복 사용
+            selected_keys = [data_keys[0]] * batch_size
+        
+        # 각 키에 대해 스케치 데이터 로드
+        batch_sketches = []
+        for key in selected_keys:
+            sketch_tokens = np.array(data[key])  # (seq_len,) 형태
+            sketch_tokens = sketch_tokens.reshape(-1)
+            batch_sketches.append(sketch_tokens)
+        
+        # batch_sketches: (b, x, y)
+        x_1, _ = collate_fn(batch_sketches)
+        x_1, attention_mask = _coordinate_transform(x_1)
+
     if times is None:
         times = torch.rand((batch_size,)) * (1.0 - min_t) + min_t
     else:
         assert times.shape == (batch_size,)
 
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y, times = x.pin_memory().to(device, non_blocking=True), \
-            y.pin_memory().to(device, non_blocking=True), \
+        x_1, times = x_1.pin_memory().to(device, non_blocking=True), \
             times.pin_memory().to(device, non_blocking=True)
+        if dataset == 'sketch':
+            attention_mask = attention_mask.pin_memory().to(device, non_blocking=True)
     else:
-        x, y, times = x.to(device), y.to(device), times.to(device)
-    return x, y, times
+        x_1, times = x_1.to(device), times.to(device)
+        if dataset == 'sketch':
+            attention_mask = attention_mask.to(device)
 
 
-def calc_loss(X, Y, times, target_mask, infill_probs, num_ones_in_mask):
-    # Use Flow Matching framework
-    # Sample from probability path
-    path_sample = prob_path.sample(x_0=X, x_1=Y, t=times)
+    # sketch 데이터셋의 경우 attention_mask도 반환
+    if dataset == 'sketch':
+        return x_1, times, attention_mask
+    else:
+        return x_1, times
+
+def collate_fn(batch_sketches):
+    # 각 스케치의 유효한 길이 계산 (패딩 토큰 제외) + EOS 토큰 고려
+    valid_lengths = []
+    for sketch in batch_sketches:
+        # 패딩 토큰이 아닌 부분의 길이 계산
+        if dataset == 'sketch':
+            # 마스크 토큰(256)이 아닌 토큰들의 개수 + EOS 토큰(2개)
+            valid_len = len(sketch) - np.sum(sketch == mask_token_id)
+            valid_lengths.append(max(2, valid_len + 2))  # +2 for EOS token
+        else:
+            valid_lengths.append(len(sketch))
     
-    # Get model predictions
-    logits = wrapped_model(path_sample.x_t, times)
+    # 배치 내 최대 길이 결정 (block_size를 넘지 않도록)
+    max_len = min(max(valid_lengths), block_size)
     
-    # Compute Flow Matching loss
+    
+    padded_sequences = []
+    attention_masks = []
+    
+    for i, sketch in enumerate(batch_sketches):
+        sketch = sketch.astype(np.int64)
+        
+        # 유효한 토큰과 패딩 토큰 구분
+        if dataset == 'sketch':
+            # 마스크 토큰이 아닌 부분을 유효한 토큰으로 간주
+            valid_mask = sketch != mask_token_id
+            valid_tokens = sketch[valid_mask]
+            
+            # 유효한 토큰이 max_len-1보다 길면 자르기 (EOS 토큰 공간 확보)
+            if len(valid_tokens) > max_len - 2:
+                valid_tokens = valid_tokens[:max_len - 2]
+            
+            # EOS 토큰 pair 추가
+            tokens_with_eos = np.concatenate([valid_tokens, [eos_token_id] * 2])
+            
+            # 패딩 추가
+            num_padding = max_len - len(tokens_with_eos)
+            if num_padding > 0:
+                padded_seq = np.concatenate([tokens_with_eos, 
+                                           np.full(num_padding, padding_token_id)])
+            else:
+                padded_seq = tokens_with_eos
+                
+            # 어텐션 마스크 생성 (유효한 토큰과 EOS는 1, 패딩은 0)
+            mask = np.concatenate([np.ones(len(tokens_with_eos)), 
+                                 np.zeros(num_padding)])
+        else:
+            # 다른 데이터셋의 경우 기존 로직 유지
+            if len(sketch) > max_len:
+                sketch = sketch[:max_len]
+                
+            num_padding = max_len - len(sketch)
+            if num_padding > 0:
+                padded_seq = np.concatenate([sketch, 
+                                           np.full(num_padding, padding_token_id)])
+            else:
+                padded_seq = sketch
+                
+            mask = np.concatenate([np.ones(len(sketch)), 
+                                 np.zeros(max(0, num_padding))])
+        
+        padded_sequences.append(padded_seq)
+        attention_masks.append(mask)
+    
+    # 리스트를 numpy 배열로 변환 후 텐서로 변환
+    padded_sequences = np.array(padded_sequences)
+    attention_masks = np.array(attention_masks)
+    
+    return torch.tensor(padded_sequences, dtype=torch.long), torch.tensor(attention_masks, dtype=torch.float)
+
+
+
+
+def calc_loss(x_0, x_1, times, attention_mask=None):
+    path_sample = prob_path.sample(x_0=x_0, x_1=x_1, t=times)
+    # print('path_sample.x_t.shape', path_sample.x_t.shape, path_sample.x_t)
+    
+    # attention_mask를 모델에 전달
+    logits = wrapped_probability_denoiser(path_sample.x_t, times, attention_mask=attention_mask)
+    # print('logits', logits[0])
     loss = flow_loss_fn(
         logits=logits,
         x_t=path_sample.x_t,
         x_1=path_sample.x_1,
+        attention_mask=attention_mask,
         t=times
     )
-    
+
     return loss
 
-
-
-# helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -303,19 +379,25 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y, times = get_batch(split)
-            
-            # Create source data (masked version)
-            X_source = torch.full_like(X, mask_token_id)  # Start from all mask tokens
-            with ctx:
-                loss = calc_loss(X_source, Y, times, None, None, None)
+            if dataset == 'sketch':
+                x_1, times, attention_mask = get_batch(split)
+                x_0 = torch.full_like(x_1, padding_token_id) # start from all mask token
+                x_0[attention_mask.to(torch.bool)] = mask_token_id
+                
+                with ctx:
+                    loss = calc_loss(x_0, x_1, times, attention_mask)
+            else:
+                x_1, times = get_batch(split)
+                x_0 = torch.full_like(x_1, mask_token_id) # start from all mask token
+                with ctx:
+                    loss = calc_loss(x_0, x_1, times)
 
             losses[k] = loss.item()
         out[split] = losses.mean() # train/val loss
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
+
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
@@ -330,98 +412,74 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-# @torch.no_grad()
-# def sample_from_flow_model(num_samples=1, seq_length=None, num_steps=50):
-#     """
-#     Sample from the trained Flow Matching model
-#     Args:
-#         num_samples: number of sequences to generate
-#         seq_length: length of sequences (default: block_size)
-#         num_steps: number of diffusion steps
-#     Returns:
-#         generated sequences
-#     """
-#     if seq_length is None:
-#         seq_length = block_size
-        
-#     model.eval()
-    
-#     # Start from all mask tokens
-#     x_init = torch.full((num_samples, seq_length), mask_token_id, device=device)
-    
-#     # Sample using the solver
-#     samples = solver.sample(
-#         x_init=x_init,
-#         step_size=1.0/num_steps,
-#         return_intermediates=False,
-#         verbose=True
-#     )
-    
-#     model.train()
-#     return samples
-
-
 # logging
-if wandb_log and master_process:
+if wandb_log:
     import wandb
-    if wandb_id == 'blank' :
-        wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=None,
-            resume=is_repeat)
-    else:
-        wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=wandb_id,
-            resume=is_repeat)
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=wandb_id,resume=is_repeat)
 
+# 초기 배치 로드
+if dataset == 'sketch':
+    x_1, times, attention_mask = get_batch('train')
+    # print('x1 check', x_1.shape)
+    # print('x_1 check: ', x_1[0], x_1.shape)
+    # print('attention_mask check:', attention_mask[0])
+    # print('attention_mask check:', attention_mask)
+    # print('check time', times[0])
+else:
+    x_1, times = get_batch('train')
+    attention_mask = None
 
-# training loop
-X, Y, times = get_batch('train') # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
+local_iter_num = 1
+t0 = time.time()  # 시간 측정을 위한 초기값 
+
 while True:
-
-    # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             try:
-                times = 0.85 * torch.ones((batch_size,))
-
-                X, Y, times = get_batch('train', times)
+                times_fixed = 0.85 * torch.ones((batch_size,))
                 
-                X_source = torch.full_like(X, mask_token_id)
-                with torch.no_grad():
-                    print("running forward pass for logging...")
-                    # Sample from path for visualization
-                    path_sample = prob_path.sample(x_0=X_source, x_1=Y, t=times)
-                    logits = wrapped_model(path_sample.x_t, times)  # (B, T, V)
+                if dataset == 'sketch':
+                    x_1_log, times_log, attention_mask_log = get_batch('train', times_fixed)
+                    x_0_log = torch.full_like(x_1_log, mask_token_id)
                     
-                predictions = torch.argmax(logits, dim=-1)
-                samples = torch.multinomial(torch.softmax(logits, dim=-1).view(-1, meta_vocab_size), num_samples=1)[:, 0].view(batch_size, -1)
-                
-                # Calculate accuracy on the intermediate state
-                matches = (samples == Y)  # (B, T)
-                acc = matches.float().mean()
-                
-                # Get some token logits for monitoring
-                first_logit_0 = logits[0, 0, 0]
-                first_logit_1 = logits[0, 0, 1] if meta_vocab_size > 1 else torch.tensor(0.0)
-                first_logit_2 = logits[0, 0, 2] if meta_vocab_size > 2 else torch.tensor(0.0)
+                    with torch.no_grad():
+                        path_sample = prob_path.sample(x_0=x_0_log, x_1=x_1_log, t=times_log)
+                        logits = wrapped_probability_denoiser(path_sample.x_t, times_log)
+                        
+                        # 어텐션 마스크 적용
+                        mask_expanded = attention_mask_log.unsqueeze(-1).expand_as(logits)
+                        masked_logits = logits * mask_expanded + (1 - mask_expanded) * (-1e9)
+                        
+                        predictions = torch.argmax(masked_logits, dim=-1)
+                        samples = torch.multinomial(torch.softmax(masked_logits, dim=-1).view(-1, meta_vocab_size), num_samples=1)[:, 0].view(batch_size, -1)
+                        
+                        # 유효한 토큰에 대해서만 정확도 계산
+                        matches = (samples == x_1_log) * attention_mask_log
+                        acc = matches.sum() / attention_mask_log.sum() if attention_mask_log.sum() > 0 else 0.0
+                else:
+                    x_1_log, times_log = get_batch('train', times_fixed)
+                    x_0_log = torch.full_like(x_1_log, mask_token_id)
                     
+                    with torch.no_grad():
+                        path_sample = prob_path.sample(x_0=x_0_log, x_1=x_1_log, t=times_log)
+                        logits = wrapped_probability_denoiser(path_sample.x_t, times_log)
+                        
+                    predictions = torch.argmax(logits, dim=-1)
+                    samples = torch.multinomial(torch.softmax(logits, dim=-1).view(-1, meta_vocab_size), num_samples=1)[:, 0].view(batch_size, -1)
+                    
+                    matches = (samples == x_1_log)
+                    acc = matches.float().mean()
+                
                 wandb.log({
                     "iter": iter_num,
                     "train/loss": losses['train'],
                     "val/loss": losses['val'],
-                    "lr": lr,
-                    "first_logit_0": first_logit_0,
-                    "first_logit_1": first_logit_1,
-                    "first_logit_2": first_logit_2,
                     "acc": acc,
                 }, step=iter_num)
             except Exception as e:
@@ -430,7 +488,7 @@ while True:
         def save_checkpoint(file_path):
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -446,43 +504,44 @@ while True:
             best_val_loss = losses['val']
             save_checkpoint(os.path.join(out_dir, 'best_ckpt.pt'))
 
-    # decide whether to do self-conditioning loop
-    if do_x1_sc and torch.rand(1, generator=shared_generator, device=device) < x1_sc_prob:
-        do_self_conf_loop = True
-    else:
-        do_self_conf_loop = False
-
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        # Flow Matching approach - use clean source/target pairs
-        X_source = torch.full_like(X, mask_token_id)  # Start from all mask tokens
-        # start forward pass in GPU
-        with ctx:
-            loss = calc_loss(X_source, Y, times, None, None, None)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        if dataset == 'sketch':
+            x_0 = torch.full_like(x_1, padding_token_id) # start from all mask token
+            x_0[attention_mask.to(torch.bool)] = mask_token_id
+            # print('x_1: ', x_1[0])
+            # print('x_0: ', x_0[0])
+            with ctx:
+                # print('in microstep: ', x_1.shape, x_1[0])
+                loss = calc_loss(x_0, x_1, times, attention_mask)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
-        # while gpu forward pass, cpu can prepare the next batch
-        X, Y, times = get_batch('train')
+            # 다음 배치 준비
+            x_1, times, attention_mask = get_batch('train')
+        else:
+            x_0 = torch.full_like(x_1, mask_token_id)  # Start from all mask tokens
+            with ctx:
+                loss = calc_loss(x_0, x_1, times)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
-        # backward pass, with gradient scaling if training in fp16
+            # 다음 배치 준비
+            x_1, times = get_batch('train')
+
         scaler.scale(loss).backward()
 
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         
 
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
-
-
+    
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    if iter_num % log_interval == 0:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         try:
@@ -496,6 +555,3 @@ while True:
 
     if iter_num > max_iters:
         break
-
-if ddp:
-    destroy_process_group()

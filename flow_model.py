@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -58,9 +59,10 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, attn_mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
+        # (b, t, embed) -> (b, t, 3 * embed)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -69,11 +71,22 @@ class SelfAttention(nn.Module):
             q = self.q_layernorm(q)
             k = self.k_layernorm(k)
 
+        final_attn_mask = None
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(torch.bool)
+            valid_mask_2d = attn_mask.unsqueeze(1) & attn_mask.unsqueeze(2) # (B, T, T)
+            valid_mask_full = valid_mask_2d.unsqueeze(1).expand(B, self.n_head, T, T) # (B, H, T, T)
 
-        # self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+            final_attn_mask = torch.zeros_like(valid_mask_full, dtype=x.dtype)
+            final_attn_mask = final_attn_mask.masked_fill_(~valid_mask_full, float('-inf'))
+            final_attn_mask = final_attn_mask.to(torch.bool).to(torch.float)
+            
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=False)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=final_attn_mask,
+                dropout_p=self.dropout if self.training else 0)
+            
+
         else:
             raise NotImplementedError
             # manual implementation of attention
@@ -118,8 +131,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# From https://github.com/yang-song/score_sde_pytorch/ which is from
-#  https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py
 def transformer_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
     # assumes timesteps is in the range 0 to 1000
 
@@ -153,7 +164,11 @@ class GPTConfig:
     proper_timestep_emb: bool = False
     d3pm_loss_weighting: bool = False
     d3pm_loss_weighting_maxT: int = 1000
-
+    # 좌표 임베딩 관련 설정
+    use_coordinate_embedding: bool = False  # x, y 좌표를 따로 임베딩할지 여부
+    eos_token_id: int = 256  # end of sequence token id
+    mask_token_id: int = 257
+    pad_token_id: int = 258
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -164,7 +179,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        print("GPT config", self.config)
+
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -173,18 +188,31 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # 좌표별 임베딩 설정
+        if config.use_coordinate_embedding:
+            # print('config.n_embd // 2', config.n_embd // 2)
+            self.x_embedding = nn.Embedding(config.vocab_size, (config.n_embd // 2), padding_idx=config.pad_token_id) # include eos, pad tokens, pad tokens will masks in attention process
+            self.y_embedding = nn.Embedding(config.vocab_size, (config.n_embd // 2), padding_idx=config.pad_token_id)
+            self.coord_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # include padding token
+        self.x_output_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.y_output_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+
         if config.do_x1_sc:
             self.xt_x1_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=config.bias)
 
         # init all weights
         self.apply(self._init_weights)
+        
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -213,85 +241,61 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+
+    def _get_coordinate_embedding(self, idx):
+        """
+        좌표 데이터를 x, y로 분리하여 각각 임베딩 처리
+        idx: (batch_size, seq_len) - [x1, x2, y1, y2, eos, eos, pad, pad, pad, pad] 형태
+        """
+        # idx = self._coordinate_transform(idx)
+
+        b, t = idx.size()
+        coord_len = t // 2
+  
+        x_coords = idx[:, :coord_len]
+        y_coords = idx[:, coord_len:]
+        
+        x_emb = self.x_embedding(x_coords) # (b, coord_len, n_embd // 2)
+        y_emb = self.y_embedding(y_coords) # (b, coord_len, n_embd // 2)
+
+        tok_emb = torch.cat([x_emb, y_emb], dim=-1) # (b, coord_len, n_embd)
+        return tok_emb  
+    
+
     def _run_net(self, idx, time, x1=None, attn_mask=None):
-        if attn_mask is not None:
-            assert attn_mask.dtype == torch.bool
         device = idx.device
         b, t = idx.size()
+
         n_embd = self.config.n_embd
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        assert (x1 is not None) == (self.config.do_x1_sc)
+        pos = torch.arange(0, t // 2, dtype=torch.long, device=device) # shape (t)
+        
+        if self.config.use_coordinate_embedding:    
+            tok_emb = self._get_coordinate_embedding(idx) # (b, t // 2, n_embd)
+        else:
+            tok_emb = self.transformer.wte(idx)
+            
 
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        assert tok_emb.shape == (b, t, n_embd)
-        assert pos_emb.shape == (t, n_embd)
-        if self.config.do_x1_sc:
-            x1_tok_emb = self.transformer.wte(x1) # token embeddings of shape (b, t, n_embd)
-            tok_emb = self.xt_x1_proj(torch.cat([tok_emb, x1_tok_emb], dim=-1))
-
-        assert time.shape == (b,)
+        pos_emb = self.transformer.wpe(pos) # (t//2,) -> position embeddings of shape (t // 2, n_embd)
+        
         if self.config.proper_timestep_emb:
             time_emb = transformer_timestep_embedding(time * 1000, n_embd)
         else:
             time_emb = transformer_timestep_embedding(time, n_embd)
         assert time_emb.shape == (b, n_embd)
+        
+        # (b, t//2, n_embd * 2) + (1, t//2, n_embd * 2) + (b, 1, n_embd * 2)
+        res = tok_emb.view(b, t // 2, n_embd) + pos_emb.view(1, t // 2, n_embd) + time_emb.view(b, 1, n_embd)
 
-        x = self.transformer.drop(tok_emb.view(b, t, n_embd) + pos_emb.view(1, t, n_embd) + time_emb.view(b, 1, n_embd))
-        for block in self.transformer.h:
-            x = block(x, attn_mask=attn_mask)
+        x = self.transformer.drop(res)
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, attn_mask=attn_mask[:, :t//2])
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
+        
+        x_head_logits = self.x_output_head(x)  # (b, t // 2, vocab_size)
+        y_head_logits = self.y_output_head(x)  # (b, t // 2, vocab_size)
+        logits = torch.cat([x_head_logits, y_head_logits], dim=1) # (b, t, vocab_size * 2)
+
         return logits
-
-    def forward(self, idx, time, targets=None, target_mask=None, do_self_conf_loop=False, attn_mask=None):
-        """
-            idx is the corrupted tokens (b, t)
-            time is the time in the corruption process (b,)
-            targets is the clean data (b, t)
-            target_mask is 1.0 for points in the sequence that have been corrupted
-                and should have loss calculated on them (b, t) 
-            do_self_cond_loop is whether to do two passes to train the self conditioning
-        """
-        b, t = idx.size()
-        assert (time < 1.1).all() # 0 to 1 not 0 to 1000
-
-        if self.config.do_x1_sc:
-            if do_self_conf_loop:
-                with torch.no_grad():
-                    x1_mask = self.config.mask_token_id * torch.ones_like(idx) # this keeps x1 as the same dtype as idx
-                    logits = self._run_net(idx, time, x1=x1_mask, attn_mask=attn_mask)
-                    x1_sample = torch.multinomial(F.softmax(logits, dim=-1).view(b*t, -1), num_samples=1).view(b, t)
-                    x1_sample = x1_sample.detach()
-
-                # maybe (b, t, v), t: seq_len, v: voc_size
-                logits = self._run_net(idx, time, x1=x1_sample, attn_mask=attn_mask)
-
-            else:
-                x1_mask = self.config.mask_token_id * torch.ones_like(idx) # this keeps x1 as the same dtype as idx
-                logits = self._run_net(idx, time, x1=x1_mask, attn_mask=attn_mask)
-
-        else:
-            logits = self._run_net(idx, time, attn_mask=attn_mask)
-
-        if targets is not None:
-            # logits: (b*t, v), targets: (b*t)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none') # (b*t,)
-            masked_loss = loss * target_mask.view(-1)
-
-            if self.config.d3pm_loss_weighting:
-                scaled_up_time = self.config.d3pm_loss_weighting_maxT * time # (b,)
-                scaled_up_time = scaled_up_time.view(b, 1).repeat(1, t).view(-1) # (b*t,)
-                scaled_up_time = torch.clamp(scaled_up_time, 0.01 * self.config.d3pm_loss_weighting_maxT, 0.99 * self.config.d3pm_loss_weighting_maxT)
-
-                masked_loss = masked_loss * 1/scaled_up_time
-
-            mean_loss = torch.sum(masked_loss) / (torch.sum(target_mask) + 1e-5)
-        else:
-            mean_loss = None
-
-        return logits, mean_loss
 
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -320,18 +324,3 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu

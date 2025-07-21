@@ -1,18 +1,18 @@
 
-out_dir = './output/graph'
-ckpt_path = './output/graph/knu-prmi-org_graph_dfm/current_ckpt.pt'
-data_dir = './data/graph'
+out_dir = './output/sketch'
+ckpt_path = './output/sketch/knu-prmi-org_graph_dfm/current_ckpt.pt'
+data_dir = './data/sketch'
 
 run_name = 'base'
 
-dataset = 'graph'
-batch_size = 10
+dataset = 'sketch'
+batch_size = 1
 block_size = 100 # context of up to 256 previous characters
 
 n_layer = 12
 n_head = 16
 n_embd = 1024
-dropout = 0.0
+dropout = 0.1
 qk_layernorm = True
 do_x1_sc = False
 
@@ -30,3 +30,5 @@ do_purity_sampling = False
 purity_temp = 1.0
 
 model_type = 'flow'
+
+div_free = 0.000001

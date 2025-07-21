@@ -11,19 +11,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.nn.functional as F
 import uuid
+from torch import nn, Tensor
 
-# -----------------------------------------------------------------------------
 # These configs will be overridden by the config file and so their values here do not matter.
 out_dir = 'out'
 
 run_name = 'gpt2' # 'run' + str(time.time())
 
-# data
 dataset = 'text8'
 batch_size = 64
 block_size = 256
 
-# model
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -32,14 +30,10 @@ bias = False
 qk_layernorm = True
 do_x1_sc = False
 
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-data_dir = '/path/to/datasets/text8' #  directory should contain meta.pkl
+data_dir = '/path/to/datasets/text8'
 
 # sampling
 total_samples = 128
@@ -51,16 +45,9 @@ x1_temp = 1.0
 use_different_x1_sc_temp = False
 x1_sc_temp = 1.0
 ignore_x1_sc = False # If true, even if the model is self conditioned, we just put in the mask condition every iteration anyway
-
-model_type = 'flow' # flow, d3pm
-
-do_purity_sampling = False
-purity_temp = 1.0
+model_type = 'flow'
 
 ckpt_path = 'out/ckpt.pt'
-
-# d3pm settings
-timesteps = 1000
 
 # Flow Matching sampling settings
 num_flow_steps = int(max_t / dt)  # Number of discretization steps
@@ -105,12 +92,24 @@ with open(meta_path, 'r') as f:
 meta_vocab_size = meta['vocab_size']
 
 print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+# add mask_token 
+eos_token_id = meta_vocab_size # 256
 
-mask_token_id = meta_vocab_size - 1
+if dataset == 'sketch':
+    meta_vocab_size += 1
+    # add eos token
+    mask_token_id = meta_vocab_size # 257
+
+    meta_vocab_size += 1
+    # add padding token    
+    padding_token_id = meta_vocab_size # 258
+    
+    meta_vocab_size += 1 # total token
 
 
 device_type = 'cuda'
 device = 'cuda:0'
+
 
 
 def load_model(ckpt_path):
@@ -118,6 +117,9 @@ def load_model(ckpt_path):
     print(f"Loading network from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = checkpoint['model_args']
+    print('model_args: ', model_args)
+    print('meta_vocab_size: ', meta_vocab_size)
+
     model_args['vocab_size'] = meta_vocab_size
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -142,6 +144,7 @@ model_information = {
     'best_val_loss': checkpoint['best_val_loss'],
     'config': checkpoint['config'],
 }
+
 torch.save(model_information, os.path.join(samples_dir, 'model_information.pt'))
 checkpoint = None
 model.eval()
@@ -151,44 +154,28 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model) # requires PyTorch 2.0
 
-# Flow Matching setup
-class FlowMatchingModelWrapper(ModelWrapper):
-    """Wrapper for GPT model to work with Flow Matching framework"""
-    def __init__(self, gpt_model):
-        super().__init__(gpt_model)
-        self.gpt_model = gpt_model
-    
-    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
-        """
-        Forward pass for Flow Matching
-        Args:
-            x: input tokens, shape (batch_size, seq_len)
-            t: time, shape (batch_size,)
-        Returns:
-            logits: output logits, shape (batch_size, seq_len, vocab_size)
-        """
-        # Convert time to proper shape for GPT model
-        # t_expanded = t.unsqueeze(-1).expand(-1, x.shape[1])  # (batch_size, seq_len)
-        logits, _ = self.gpt_model(x, t)
-        logits = torch.softmax(logits, dim=-1)
-
-        return logits
-
-
 class WrappedModel(ModelWrapper):
     def forward(self, x: torch.Tensor, t: torch.Tensor, **extras):
-        return torch.softmax(self.model(x, t), dim=-1)
+        attention_mask = torch.zeros_like(x, dtype=torch.bool)  # No attention mask needed for sampling
+        return torch.softmax(self.model._run_net(idx=x, time=t, attn_mask=attention_mask), dim=-1)
     
-    
+# ----------------- SAMPLING CODE --------------=-
+
+S = meta_vocab_size
+B = batch_size
+D = block_size
+
+
+x0 = torch.zeros((S)) + mask_token_id
 scheduler = PolynomialConvexScheduler(n=1.0)  # Linear scheduler
 prob_path = MixtureDiscreteProbPath(scheduler=scheduler)
-wrapped_probability_denoiser = FlowMatchingModelWrapper(model)
+wrapped_probability_denoiser = WrappedModel(model)
 solver = MixtureDiscreteEulerSolver(
     model=wrapped_probability_denoiser,
     path=prob_path,
-    vocabulary_size=meta_vocab_size
+    vocabulary_size=meta_vocab_size,
+    source_distribution_p=x0.to(device)
 )
-
 
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -196,11 +183,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 print(torch.__version__)
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# ----------------- SAMPLING CODE --------------=-
 
-S = meta_vocab_size
-B = batch_size
-D = block_size
 
 # write an empty file to store the samples eventually
 with open(os.path.join(samples_dir, 'samples.txt'), 'w') as f:

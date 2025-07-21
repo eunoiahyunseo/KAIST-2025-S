@@ -173,7 +173,7 @@ class MixtureDiscreteEulerSolver(Solver):
                 time_grid = get_nearest_times(
                     time_grid=time_grid, t_discretization=t_discretization
                 )
-        print('x_init: ', x_init)
+
         x_t = x_init.clone()
         steps_counter = 0
         res = []
@@ -192,39 +192,48 @@ class MixtureDiscreteEulerSolver(Solver):
 
         with ctx:
             for i in range(n_steps):
+
                 t = t_discretization[i : i + 1]
                 h = t_discretization[i + 1 : i + 2] - t_discretization[i : i + 1]
 
                 # Sample x_1 ~ p_1|t( \cdot |x_t)
                 p_1t = self.model(x=x_t, t=t.repeat(x_t.shape[0]), **model_extras)
-                print('p_1t', p_1t.shape)
                 x_1 = categorical(p_1t.to(dtype=dtype_categorical))
 
                 # Checks if final step
                 if i == n_steps - 1:
                     x_t = x_1
                 else:
-                    # Compute u_t(x|x_t,x_1)
+                    # Compute u_t(x|x_t,x_1), x_i not same with y_i
                     scheduler_output = self.path.scheduler(t=t)
 
+                    # i think this part is not independent with tokenposition
                     k_t = scheduler_output.alpha_t
                     d_k_t = scheduler_output.d_alpha_t
-                    print('k_t', k_t.shape, 'and d_k_t: ', d_k_t.shape)
 
-                    # 
+                    # (b, s, v)
                     delta_1 = F.one_hot(x_1, num_classes=self.vocabulary_size).to(
                         k_t.dtype
                     )
-                    print('delta_1', delta_1.shape)
-                    u = d_k_t / (1 - k_t) * delta_1
-                    print('u', u)
+                    
+
+                    ## for the safe sampling
+                    epsilon = 1e-8
+                    k_t_safe = k_t.clamp(min=epsilon, max=1.0-epsilon)
+                    one_minus_k_t_safe = (1.0 - k_t).clamp(min=epsilon, max=1.0-epsilon)
+                    u = d_k_t / one_minus_k_t_safe * delta_1
+                    # u = d_k_t / (1 - k_t) * delta_1
+
                     # Add divergence-free part
                     div_free_t = div_free(t) if callable(div_free) else div_free
 
                     if div_free_t > 0:
                         p_0 = self.source_distribution_p[(None,) * x_t.dim()]
-                        u = u + div_free_t * d_k_t / (k_t * (1 - k_t)) * (
-                            (1 - k_t) * p_0 + k_t * delta_1
+                        # u = u + div_free_t * d_k_t / (k_t * (1 - k_t)) * (
+                        #     (1 - k_t) * p_0 + k_t * delta_1
+                        # )
+                        u = u + div_free_t * d_k_t / (k_t_safe * one_minus_k_t_safe) * (
+                            one_minus_k_t_safe * p_0 + k_t_safe * delta_1
                         )
 
                     # Set u_t(x_t|x_t,x_1) = 0
@@ -235,10 +244,13 @@ class MixtureDiscreteEulerSolver(Solver):
 
                     # Sample x_t ~ u_t( \cdot |x_t,x_1)
                     intensity = u.sum(dim=-1)  # Assuming u_t(xt|xt,x1) := 0
+                    
+                    # probability to jumpy another state
                     mask_jump = torch.rand(
                         size=x_t.shape, device=x_t.device
                     ) < 1 - torch.exp(-h * intensity)
 
+                    # when you decided to jump, then jump according to Q(x, y) / \lambda(x)
                     if mask_jump.sum() > 0:
                         x_t[mask_jump] = categorical(
                             u[mask_jump].to(dtype=dtype_categorical)

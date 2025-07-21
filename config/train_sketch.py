@@ -1,7 +1,7 @@
 out_dir = './output/sketch'
 eval_interval = 500
 eval_iters = 200
-log_interval = 100
+log_interval = 10
 
 data_dir = './data/sketch'
 
@@ -17,16 +17,16 @@ wandb_run_name = 'graph_dfm'
 wandb_id = 'knu-prmi-org'
 is_repeat = False
 
-dataset = 'graph'
-gradient_accumulation_steps = 1
-batch_size = 16
-block_size = 100
+dataset = 'sketch'
+gradient_accumulation_steps = 4
+batch_size = 12
+block_size = 120
 overfit_batch = False
 
 n_layer = 12
 n_head = 16
 n_embd = 1024
-dropout = 0
+dropout = 0.1
 qk_layernorm = True
 proper_timestep_emb = False
 do_x1_sc = False
