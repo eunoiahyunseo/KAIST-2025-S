@@ -83,7 +83,7 @@ class MixtureDiscreteProbPath(ProbPath):
 
         sigma_t = expand_tensor_like(input_tensor=sigma_t, expand_to=x_1)
 
-        padding_token_id = 258
+        padding_token_id = 0
         is_padding = (x_0 == padding_token_id)
 
         source_indices = torch.rand(size=x_1.shape, device=x_1.device) < sigma_t

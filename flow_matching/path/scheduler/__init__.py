@@ -15,6 +15,7 @@ from .scheduler import (
     SchedulerOutput,
     VPScheduler,
 )
+from .corrector_scheduler import CorrectorScheduler
 
 __all__ = [
     "CondOTScheduler",
@@ -26,4 +27,5 @@ __all__ = [
     "VPScheduler",
     "LinearVPScheduler",
     "SchedulerOutput",
+    "CorrectorScheduler",
 ]

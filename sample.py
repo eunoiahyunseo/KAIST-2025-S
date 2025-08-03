@@ -46,7 +46,7 @@ use_different_x1_sc_temp = False
 x1_sc_temp = 1.0
 ignore_x1_sc = False # If true, even if the model is self conditioned, we just put in the mask condition every iteration anyway
 model_type = 'flow'
-
+source_distribution = 'mask'
 ckpt_path = 'out/ckpt.pt'
 
 # Flow Matching sampling settings
@@ -77,7 +77,7 @@ from flow_model import GPT, GPTConfig
 
 # Flow Matching imports
 from flow_matching.path import MixtureDiscreteProbPath
-from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.path.scheduler import PolynomialConvexScheduler, CorrectorScheduler
 from flow_matching.solver import MixtureDiscreteEulerSolver
 from flow_matching.utils import ModelWrapper
 
@@ -89,27 +89,19 @@ assert os.path.exists(meta_path)
 import json
 with open(meta_path, 'r') as f:
     meta = json.load(f)
-meta_vocab_size = meta['vocab_size']
 
-print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-# add mask_token 
-eos_token_id = meta_vocab_size # 256
+meta_vocab_size = meta['vocab_size'] + 1 if source_distribution == 'mask' else meta['vocab_size']
 
-if dataset == 'sketch':
-    meta_vocab_size += 1
-    # add eos token
-    mask_token_id = meta_vocab_size # 257
+padding_token_id = 0
+sep_token_id = 1
+mask_token_id = meta_vocab_size - 1 if source_distribution == 'mask' else None
 
-    meta_vocab_size += 1
-    # add padding token    
-    padding_token_id = meta_vocab_size # 258
-    
-    meta_vocab_size += 1 # total token
-
+# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+iter_num = 1
+best_val_loss = 1e9
 
 device_type = 'cuda'
 device = 'cuda:0'
-
 
 
 def load_model(ckpt_path):
@@ -119,14 +111,14 @@ def load_model(ckpt_path):
     model_args = checkpoint['model_args']
     print('model_args: ', model_args)
     print('meta_vocab_size: ', meta_vocab_size)
-
     model_args['vocab_size'] = meta_vocab_size
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    
     unwanted_prefix = '_orig_mod.'
+    
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
@@ -155,21 +147,30 @@ if compile:
     model = torch.compile(model) # requires PyTorch 2.0
 
 class WrappedModel(ModelWrapper):
-    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras):
-        attention_mask = torch.zeros_like(x, dtype=torch.bool)  # No attention mask needed for sampling
-        return torch.softmax(self.model._run_net(idx=x, time=t, attn_mask=attention_mask), dim=-1)
-    
-# ----------------- SAMPLING CODE --------------=-
+    def __init__(self, model, temperature: float = 1.0): # add temperature 
+        super().__init__(model)
+        self.temperature = temperature
+
+    def forward(self, x_t: torch.Tensor, times: torch.Tensor, **extras):
+        return F.softmax(self.model(x_t=x_t, times=times), dim=-1)
+
 
 S = meta_vocab_size
 B = batch_size
 D = block_size
+coupling = 'C'
 
+temperature = 1
 
-x0 = torch.zeros((S)) + mask_token_id
-scheduler = PolynomialConvexScheduler(n=1.0)  # Linear scheduler
+if source_distribution == 'mask':
+    x0 = torch.zeros((S)) + mask_token_id
+elif source_distribution == 'uniform':
+    x0 = torch.randint(low=padding_token_id + 1, high=meta_vocab_size - 1, size=(S,))
+
+scheduler = PolynomialConvexScheduler(n=1.0)
+corrector_scheduler = CorrectorScheduler(alpha_param=div_free, a=0.25, b=0.25)
 prob_path = MixtureDiscreteProbPath(scheduler=scheduler)
-wrapped_probability_denoiser = WrappedModel(model)
+wrapped_probability_denoiser = WrappedModel(model=model, temperature=temperature)
 solver = MixtureDiscreteEulerSolver(
     model=wrapped_probability_denoiser,
     path=prob_path,
@@ -183,8 +184,6 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 print(torch.__version__)
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-
-
 # write an empty file to store the samples eventually
 with open(os.path.join(samples_dir, 'samples.txt'), 'w') as f:
     pass
@@ -196,49 +195,54 @@ with torch.no_grad():
         for batch_idx in range(total_samples // B):
             print(f"Processing batch {batch_idx + 1}/{total_samples // B}")
 
-            if model_type == 'flow':
-                # Initialize with mask tokens (source distribution)
+            # Initialize with mask tokens (source distribution)
+            # x_init = torch.full((B, D), mask_token_id, device=device, dtype=torch.long)
+            if source_distribution == 'uniform':
+                x_init = torch.randint(low=padding_token_id + 1, high=meta_vocab_size - 1, size=(B, D), device=device)
+            elif source_distribution == 'mask':
                 x_init = torch.full((B, D), mask_token_id, device=device, dtype=torch.long)
+                            
+            print(f"Sampling using Flow Matching solver with {num_flow_steps} steps...")
+            print(f"Step size: {dt}, Max time: {max_t}")
+            
+            # Use Flow Matching solver for sampling
+            if return_intermediates:
+                # Define time grid for intermediate sampling
+                time_grid = torch.linspace(0.0, max_t, steps=10, device=device)
                 
-                print(f"Sampling using Flow Matching solver with {num_flow_steps} steps...")
-                print(f"Step size: {dt}, Max time: {max_t}")
+                samples = solver.sample(
+                    x_init=x_init,
+                    step_size=dt,
+                    div_free=corrector_scheduler,
+                    dtype_categorical=dtype_categorical,
+                    time_grid=time_grid,
+                    return_intermediates=True,
+                    verbose=True
+                )
                 
-                # Use Flow Matching solver for sampling
-                if return_intermediates:
-                    # Define time grid for intermediate sampling
-                    time_grid = torch.linspace(0.0, max_t, steps=10, device=device)
-                    samples = solver.sample(
-                        x_init=x_init,
-                        step_size=dt,
-                        div_free=div_free,
-                        dtype_categorical=dtype_categorical,
-                        time_grid=time_grid,
-                        return_intermediates=True,
-                        verbose=True
-                    )
-                    
-                    # Save intermediate states if needed
-                    print(f"Intermediate samples shape: {samples.shape}")
-                    samples = samples[-1]  # Take final samples
-                else:
-                    samples = solver.sample(
-                        x_init=x_init,
-                        step_size=dt,
-                        div_free=div_free,
-                        dtype_categorical=dtype_categorical,
-                        return_intermediates=False,
-                        verbose=True
-                    )
+                # Save intermediate states if needed
+                print(f"Intermediate samples shape: {samples.shape}")
+                samples = samples[-1]  # Take final samples
+            else:
+                samples = solver.sample(
+                    x_init=x_init,
+                    step_size=dt,
+                    div_free=div_free,
+                    dtype_categorical=dtype_categorical,
+                    return_intermediates=False,
+                    verbose=True
+                )
+
+            print(f"Sampling completed. Final samples shape: {samples.shape}")
+            
+            # Apply final argmax if requested
+            if argmax_final:
+                print("Applying final argmax to remaining mask tokens...")
+                # Get final predictions
+                t_final = torch.ones((B,), device=device) * max_t
+                logits = wrapped_probability_denoiser(samples, t_final)
                 
-                print(f"Sampling completed. Final samples shape: {samples.shape}")
-                
-                # Apply final argmax if requested
-                if argmax_final:
-                    print("Applying final argmax to remaining mask tokens...")
-                    # Get final predictions
-                    t_final = torch.ones((B,), device=device) * max_t
-                    logits = wrapped_probability_denoiser(samples, t_final)
-                    
+                if source_distribution == 'mask':
                     # Only update positions that are still mask tokens
                     sample_is_mask = (samples == mask_token_id).float()
                     num_remaining_masks = sample_is_mask.sum().item()
@@ -247,10 +251,15 @@ with torch.no_grad():
                     if num_remaining_masks > 0:
                         argmax_samples = torch.argmax(logits, dim=-1)
                         samples = (argmax_samples * sample_is_mask + 
-                                  samples * (1 - sample_is_mask)).long()
+                                samples * (1 - sample_is_mask)).long()
 
                 samples_np = samples.cpu().detach().numpy() # (B, D)
                 
+                sketch_dict_to_save = {f'{i}': samples_np[i] for i in range(samples_np.shape[0])}
+
+                output_npz_path = os.path.join(samples_dir, f'samples_batch_{batch_idx}.npz')
+                np.savez_compressed(output_npz_path, **sketch_dict_to_save)
+
             # Save samples to file
             for sample_idx in range(samples_np.shape[0]):
                 with open(os.path.join(samples_dir, 'samples.txt'), 'a') as f:

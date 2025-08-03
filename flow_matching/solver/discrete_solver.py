@@ -75,6 +75,7 @@ class MixtureDiscreteEulerSolver(Solver):
         path: MixtureDiscreteProbPath,
         vocabulary_size: int,
         source_distribution_p: Optional[Tensor] = None,
+        predictor = None,
     ):
         super().__init__()
         self.model = model
@@ -87,6 +88,8 @@ class MixtureDiscreteEulerSolver(Solver):
             ), f"Source distribution p dimension must match the vocabulary size {vocabulary_size}. Got {source_distribution_p.shape}."
 
         self.source_distribution_p = source_distribution_p
+
+        self.predictor = predictor
 
     @torch.no_grad()
     def sample(
@@ -195,60 +198,78 @@ class MixtureDiscreteEulerSolver(Solver):
 
                 t = t_discretization[i : i + 1]
                 h = t_discretization[i + 1 : i + 2] - t_discretization[i : i + 1]
+                
+                t_batch = t.repeat(x_t.shape[0])
 
                 # Sample x_1 ~ p_1|t( \cdot |x_t)
-                p_1t = self.model(x=x_t, t=t.repeat(x_t.shape[0]), **model_extras)
-                x_1 = categorical(p_1t.to(dtype=dtype_categorical))
+                p_1t_uncond = self.model(x_t=x_t, times=t_batch, **model_extras)
+                x_1_uncond = categorical(p_1t_uncond.to(dtype=dtype_categorical))
+
+                scheduler_output = self.path.scheduler(t=t)
+                k_t, d_k_t = scheduler_output.alpha_t, scheduler_output.d_alpha_t
+
+                # (B, S, V)
+                delta_1_uncond = F.one_hot(x_1_uncond, num_classes=self.vocabulary_size).to(k_t.dtype)
+                
+                epsilon = 1e-8
+                k_t_safe = k_t.clamp(min=epsilon)
+                one_minus_k_t_safe = (1.0 - k_t_safe).clamp(min=epsilon)
+
+                forward_coeff = d_k_t / one_minus_k_t_safe
+                # u의 각 요소 u(x_i)는 각 토큰이 x_i로 변하려는 순간적인 비율 (rate)를 의미한다.
+                u_uncond = forward_coeff * delta_1_uncond
+                u = u_uncond
 
                 # Checks if final step
                 if i == n_steps - 1:
-                    x_t = x_1
+                    x_t = x_1_uncond
                 else:
-                    # Compute u_t(x|x_t,x_1), x_i not same with y_i
-                    scheduler_output = self.path.scheduler(t=t)
-
-                    # i think this part is not independent with tokenposition
-                    k_t = scheduler_output.alpha_t
-                    d_k_t = scheduler_output.d_alpha_t
-
-                    # (b, s, v)
-                    delta_1 = F.one_hot(x_1, num_classes=self.vocabulary_size).to(
-                        k_t.dtype
-                    )
-                    
-
-                    ## for the safe sampling
-                    epsilon = 1e-8
-                    k_t_safe = k_t.clamp(min=epsilon, max=1.0-epsilon)
-                    one_minus_k_t_safe = (1.0 - k_t).clamp(min=epsilon, max=1.0-epsilon)
-                    u = d_k_t / one_minus_k_t_safe * delta_1
-                    # u = d_k_t / (1 - k_t) * delta_1
-
-                    # Add divergence-free part
+            
+                    # for the corrector_scheduler
                     div_free_t = div_free(t) if callable(div_free) else div_free
 
                     if div_free_t > 0:
                         p_0 = self.source_distribution_p[(None,) * x_t.dim()]
-                        # u = u + div_free_t * d_k_t / (k_t * (1 - k_t)) * (
-                        #     (1 - k_t) * p_0 + k_t * delta_1
-                        # )
-                        u = u + div_free_t * d_k_t / (k_t_safe * one_minus_k_t_safe) * (
-                            one_minus_k_t_safe * p_0 + k_t_safe * delta_1
-                        )
+                        backward_related_coeff = d_k_t / (k_t_safe * one_minus_k_t_safe)
+                        backward_related_term = (one_minus_k_t_safe * p_0 + k_t_safe * delta_1_uncond)
+                        u = u + div_free_t * backward_related_coeff * backward_related_term
+
+                        # calculate h_adaptive
+                        max_effective_rate = (1.0 + div_free_t) * (d_k_t / one_minus_k_t_safe) + \
+                                            div_free_t * (d_k_t / k_t_safe)
+                
+                        max_effective_rate = max_effective_rate.clamp(min=epsilon)
+
+                        # Calculate adaptive step size
+                        h_adaptive = torch.min(h, 1.0 / max_effective_rate)
+
+                        current_h = h_adaptive
+                    else:
+                        max_effective_rate = one_minus_k_t_safe / d_k_t
+                        max_effective_rate = max_effective_rate.clamp(min=epsilon)
+                        h_adaptive = torch.min(h, 1.0 / max_effective_rate)
+                        current_h = h_adaptive
 
                     # Set u_t(x_t|x_t,x_1) = 0
                     delta_t = F.one_hot(x_t, num_classes=self.vocabulary_size)
+                    # 현재 토큰 x_t에 해당하는 위치의 u값을 0으로 만든다.
+                    # 이렇게 하면 텐서는 순수하게 '들어오는' 양수 속도만 남게 된다. 음수 속도는 잠시 제거된다.
                     u = torch.where(
                         delta_t.to(dtype=torch.bool), torch.zeros_like(u), u
                     )
 
                     # Sample x_t ~ u_t( \cdot |x_t,x_1)
+                    # 모든 들어오는 속도의 총합이 된다.
+                    # CE에 따라 intensity = -u_t(x_t)
                     intensity = u.sum(dim=-1)  # Assuming u_t(xt|xt,x1) := 0
                     
                     # probability to jumpy another state
+                    # 바꿀지 말지를 결정하는 확률적 로직
+                    # Poisson process에 따라 비율(intensity) \lambda로 발생하는 사건이 작은 시간 h동안 한 번 이상 일어날 확률은
+                    # 1 - exp(-\lambda h) 이다.
                     mask_jump = torch.rand(
                         size=x_t.shape, device=x_t.device
-                    ) < 1 - torch.exp(-h * intensity)
+                    ) < 1 - torch.exp(-current_h * intensity)
 
                     # when you decided to jump, then jump according to Q(x, y) / \lambda(x)
                     if mask_jump.sum() > 0:
@@ -257,7 +278,7 @@ class MixtureDiscreteEulerSolver(Solver):
                         )
 
                 steps_counter += 1
-                t = t + h
+                t = t + current_h
 
                 if return_intermediates and (t in time_grid):
                     res.append(x_t.clone())
