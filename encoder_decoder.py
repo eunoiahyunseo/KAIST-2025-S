@@ -1,16 +1,19 @@
+
+# encoder_decoder.py (이 코드로 파일 전체를 교체하세요)
+
 import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
 from typing import Tuple
+from sklearn.cluster import KMeans
 
 
 class PositionalEncoding(nn.Module):
-    """Transformer에서 사용하는 Sinusoidal Positional Encoding을 구현합니다."""
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    # (이전과 동일, 변경 없음)
+    def __init__(self, d_model: int, dropout: float = 0, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
         pe = torch.zeros(max_len, 1, d_model)
@@ -19,314 +22,311 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (seq_len, batch_size, d_model)
-        Returns:
-            (seq_len, batch_size, d_model)
-        """
         x = x + self.pe[:x.size(0)]
         return self.dropout(x)
 
 class VectorEncoder(nn.Module):
-    def __init__(self, input_dim=3, d_model=64, nhead=8, num_layers=6, d_seq=32):
+    # (이전과 동일, Mean Pooling 없음)
+    def __init__(self, input_dim=3, d_model=256, d_seq=32, nhead=8, num_layers=6):
         super().__init__()
         self.d_model = d_model
         self.embedding = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=d_model*4)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        self.output_layer = nn.Linear(d_model, d_seq)
+        self.output_proj = nn.Linear(d_model, d_seq)
 
     def forward(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            src (torch.Tensor): 스트로크 시퀀스. Shape: (B, Np, 3) (x, y, pen_state)
-            src_mask (torch.Tensor): 패딩 마스크. Shape: (B, Np)
+        batch_size = src.shape[0]
+        embedded = self.embedding(src) * math.sqrt(self.d_model)
+        sos_token = torch.zeros(batch_size, 1, self.d_model, device=src.device)
+        full_seq = torch.cat([sos_token, embedded], dim=1)
 
-        Returns:
-            torch.Tensor: 인코딩된 시퀀스 잠재 벡터. Shape: (B, d_seq)
-        """
-        embedded = self.embedding(src) * math.sqrt(self.d_model) # (B, Np, d_model)
-        pos_encoded = self.pos_encoder(embedded.permute(1, 0, 2)).permute(1, 0, 2) # (B, Np, d_model)
+        pos_encoded = self.pos_encoder(full_seq.permute(1, 0, 2)).permute(1, 0, 2)
         
-        padding_mask = (src_mask == 0)
+        full_mask = torch.cat([torch.ones(batch_size, 1, device=src.device), src_mask], dim=1)
+        encoded_seq = self.transformer_encoder(pos_encoded, src_key_padding_mask=(full_mask == 0))
 
-        encoded = self.transformer_encoder(pos_encoded, src_key_padding_mask=padding_mask) # (B, Np, d_model)
-
-        encoded = encoded * src_mask.unsqueeze(-1)
-        masked_sum = encoded.sum(dim=1)
-        valid_tokens = src_mask.sum(dim=1).unsqueeze(-1)
-        mean_pooled = masked_sum / valid_tokens.clamp(min=1e-9)
-
-        z_seq = self.output_layer(mean_pooled) # (B, d_seq)
-        return z_seq
+        projected_seq = self.output_proj(encoded_seq)
+        return projected_seq
 
 class ImageEncoder(nn.Module):
-    def __init__(self, in_channels=1, d_img=64):
+    # (이전과 동일, UDF 이미지 인코딩 담당)
+    def __init__(self, in_channels=1, d_img=128):
         super().__init__()
         self.encoder = nn.Sequential(
-            self._make_block(in_channels, 64),  # 64x64 -> 32x32
-            self._make_block(64, 128),          # 32x32 -> 16x16
-            self._make_block(128, 256),         # 16x16 -> 8x8
-            self._make_block(256, 512),         # 8x8 -> 4x4
-            self._make_block(512, 512),         # 4x4 -> 2x2
-            self._make_block(512, 512, pool=False) # 2x2 -> 2x2
+            nn.Conv2d(in_channels, 64, 3, 2, 1), nn.ReLU(True),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(True),
+            nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(True),
+            nn.Conv2d(256, 512, 3, 2, 1), nn.ReLU(True),
+            nn.AdaptiveAvgPool2d((1, 1))
         )
-        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, d_img)
 
-    def _make_block(self, in_c, out_c, pool=True):
-        layers = [
-            nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        ]
-        if pool:
-            layers.append(nn.MaxPool2d(2))
-        return nn.Sequential(*layers)
-
     def forward(self, src: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            src (torch.Tensor): UDF 이미지. Shape: (B, 1, 64, 64)
-
-        Returns:
-            torch.Tensor: 인코딩된 이미지 잠재 벡터. Shape: (B, d_img)
-        """
-        encoded = self.encoder(src) # (B, 512, 2, 2)
-        pooled = self.avg_pool(encoded) # (B, 512, 1, 1)
-        flattened = torch.flatten(pooled, 1) # (B, 512)
-        z_img = self.fc(flattened) # (B, d_img)
-        return z_img
-
-class StrokeUDFEncoder(nn.Module):
-    """Dual-Modal 인코더: Vector와 Image 인코더를 결합하여 최종 잠재 벡터 생성"""
-    def __init__(self, vector_encoder, image_encoder, d_seq=32, d_img=64, d_f=128):
+        encoded = self.encoder(src).squeeze(-1).squeeze(-1)
+        return self.fc(encoded)
+    
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, d_seq: int, d_img: int, embedding_dim: int, nhead: int):
         super().__init__()
-        self.vector_encoder = vector_encoder
-        self.image_encoder = image_encoder
-        self.fusion_layer = nn.Linear(d_seq + d_img, d_f)
-
-    def forward(self, stroke_seq: torch.Tensor, stroke_mask: torch.Tensor, udf_image: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            stroke_seq (torch.Tensor): 스트로크 시퀀스. Shape: (B, Np, 3)
-            stroke_mask (torch.Tensor): 스트로크 패딩 마스크. Shape: (B, Np)
-            udf_image (torch.Tensor): UDF 이미지. Shape: (B, 1, 64, 64)
-
-        Returns:
-            torch.Tensor: 융합된 최종 잠재 벡터. Shape: (B, d_f)
-        """
-        z_seq = self.vector_encoder(stroke_seq, stroke_mask) # (B, d_seq)
-        z_img = self.image_encoder(udf_image) # (B, d_img)
-        
-        fused = torch.cat([z_seq, z_img], dim=1) # (B, d_seq + d_img)
-        z_e = self.fusion_layer(fused) # (B, d_f)
-        return z_e
-
-
-class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
-        """
-        Vector Quantization 레이어.
-        Args:
-            num_embeddings (int): 코드북의 크기 (K).
-            embedding_dim (int): 각 코드북 벡터의 차원. Encoder의 출력 차원과 같아야 함.
-            commitment_cost (float): Commitment 손실의 가중치 (β).
-        """
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_embeddings = num_embeddings
-        self.commitment_cost = commitment_cost
-        
-        # 코드북을 nn.Embedding으로 정의. (K, D)
-        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-        # 코드북 벡터를 [-1, 1] 범위에서 균등 분포로 초기화
-        self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 입력 z_e의 shape: (B, D)
-        # 코드북의 shape: (K, D)
-        
-        # 1. 가장 가까운 코드북 벡터 찾기
-        # 거리 계산: ||z_e - e_k||^2 = ||z_e||^2 - 2*z_e*e_k^T + ||e_k||^2
-        distances = (torch.sum(inputs**2, dim=1, keepdim=True) 
-                     + torch.sum(self.embedding.weight**2, dim=1)
-                     - 2 * torch.matmul(inputs, self.embedding.weight.t()))
-        
-        # 가장 가까운 코드의 인덱스 찾기
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1) # (B, 1)
-        
-        # 인덱스를 one-hot 벡터로 변환 (B, K)
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        
-        # 2. 양자화된 벡터 z_q 생성
-        quantized = torch.matmul(encodings, self.embedding.weight) # (B, D)
-        
-        # 3. 손실 계산
-        # 코드북 손실: 코드북 벡터가 인코더 출력에 가까워지도록 학습
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        # Commitment 손실: 인코더가 선택된 코드북 벡터에 전념하도록 학습
-        q_latent_loss = F.mse_loss(inputs, quantized.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        
-        # 4. Straight-Through Estimator: Decoder로 가는 그래디언트를 인코더로 복사
-        quantized = inputs + (quantized - inputs).detach()
-        
-        return loss, quantized, encoding_indices.squeeze()
-
-class VectorDecoder(nn.Module):
-    """잠재 벡터로부터 스트로크 시퀀스를 복원하는 Transformer 기반 디코더 [cite: 181]"""
-    def __init__(self, output_dim=3, d_model=64, nhead=8, num_layers=6, d_f=128, max_len=48):
-        super().__init__()
-        self.max_len = max_len
-        self.d_model = d_model
-        self.latent_proj = nn.Linear(d_f, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_len)
-        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
-        self.output_layer = nn.Linear(d_model, output_dim)
-        self.coord_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 2),
-            nn.Sigmoid()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=d_seq, 
+            kdim=d_img, 
+            vdim=d_img, 
+            num_heads=nhead, 
+            batch_first=True
         )
-        self.pen_state_head = nn.Linear(d_model, 1) # 활성화 함수 없이 로짓을 출력
-
-
-    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
-        B = z_q.shape[0]
-        memory = self.latent_proj(z_q).unsqueeze(1).repeat(1, self.max_len, 1) # (B, Np, d_model)
+        self.norm1 = nn.LayerNorm(d_seq)
+        self.norm2 = nn.LayerNorm(d_seq)
         
-        # 타겟 시퀀스를 생성하기 위한 초기 입력 (0으로 채움)
-        tgt = torch.zeros(B, self.max_len, self.d_model, device=z_q.device)
-        tgt_pos = self.pos_encoder(tgt.permute(1, 0, 2)).permute(1, 0, 2)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_seq, d_seq * 4),
+            nn.ReLU(),
+            nn.Linear(d_seq * 4, d_seq)
+        )
         
-        decoded_features = self.transformer_decoder(tgt_pos, memory) # (B, Np, d_model)
+        self.final_proj = nn.Linear(d_seq, embedding_dim)
+        self.final_norm = nn.LayerNorm(embedding_dim)
 
-        coords = self.coord_head(decoded_features) # (B, Np, 2)
-        pen_state_logit = self.pen_state_head(decoded_features).squeeze(-1) # (B, Np, 1) -> (B, Np)
+    def forward(self, z_seq: torch.Tensor, z_img: torch.Tensor) -> torch.Tensor:
+        z_img_seq = z_img.unsqueeze(1)
+        attn_output, _ = self.attention(query=z_seq, key=z_img_seq, value=z_img_seq)
+        x = self.norm1(z_seq + attn_output)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
+        output = self.final_norm(self.final_proj(x))
+        return output
+    
+class FusionEncoder(nn.Module):
+    """(신규) Vector 시퀀스와 Image 벡터를 결합하는 융합 모듈"""
+    def __init__(self, d_model: int, d_img: int, embedding_dim: int):
+        super().__init__()
+        self.fusion_layer = nn.Linear(d_model + d_img, embedding_dim)
+        self.fusion_layer2 = nn.Linear(d_model, embedding_dim)
+        self.norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, z_seq: torch.Tensor, z_img: torch.Tensor) -> torch.Tensor:
+        Np = z_seq.size(1)
+        z_img_expanded = z_img.unsqueeze(1).repeat(1, Np, 1)
+        # print('sex', z_img_expanded[0, :20, :10])
+        # print('sex2', z_seq[0, :20, :10])
+        # fused_seq = torch.cat([z_seq, z_img_expanded], dim=-1)
+        # output_seq = self.fusion_layer(fused_seq)
+        fused_seq = torch.cat([z_seq], dim=-1)
+        # output_seq = self.fusion_layer2(fused_seq)
+        return self.norm(fused_seq)
+
+class SequentialVectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.commitment_cost = commitment_cost
+
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, Np, D = inputs.shape
 
 
+        valid_indices = torch.where(mask.view(-1) == 1)[0]
+        valid_inputs = inputs.view(-1, D)[valid_indices]
+
+        distances = torch.sum(valid_inputs**2, dim=1, keepdim=True) + torch.sum(self.embedding.weight**2, dim=1) - 2 * torch.matmul(valid_inputs, self.embedding.weight.t())
+        encoding_indices_valid = torch.argmin(distances, dim=1)
+
+        quantized_valid = F.embedding(encoding_indices_valid, self.embedding.weight)
+        
+        loss = F.mse_loss(quantized_valid, valid_inputs.detach()) + self.commitment_cost * F.mse_loss(valid_inputs, quantized_valid.detach())
+        
+        quantized_valid_sg = valid_inputs + (quantized_valid - valid_inputs).detach()
+        
+        quantized_seq = torch.zeros_like(inputs)
+        quantized_seq.view(-1, D)[valid_indices] = quantized_valid_sg
+        
+        indices_seq = torch.full((B * Np,), -1, device=inputs.device, dtype=torch.long)
+        indices_seq[valid_indices] = encoding_indices_valid
+        indices_seq = indices_seq.view(B, Np)
+        return loss, quantized_seq, indices_seq
+
+class VectorDecoderAR(nn.Module):
+    def __init__(self, output_dim=3, d_model=256, nhead=8, num_layers=6, embedding_dim=256):
+        super().__init__()
+        self.d_model = d_model
+        self.input_embedding = nn.Linear(output_dim, d_model)
+        self.input_dropout = nn.Dropout(0.1) # <-- Dropout 레이어 추가
+
+        self.pos_encoder = PositionalEncoding(d_model)
+        self.memory_proj = nn.Linear(embedding_dim, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, batch_first=True, dim_feedforward=d_model*4)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
+        self.coord_head = nn.Sequential(nn.Linear(d_model, 2), nn.Sigmoid())
+        self.pen_state_head = nn.Linear(d_model, 1)
+
+    def forward(self, tgt_seq: torch.Tensor, memory: torch.Tensor, memory_padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt_embedded = self.input_embedding(tgt_seq) * math.sqrt(self.d_model)
+        
+
+        tgt_pos = self.pos_encoder(tgt_embedded.permute(1, 0, 2)).permute(1, 0, 2)
+        memory_projected = self.memory_proj(memory)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(tgt_seq.size(1)).to(tgt_seq.device)
+        decoded_features = self.transformer_decoder(tgt_pos, memory_projected, tgt_mask=causal_mask, memory_key_padding_mask=memory_padding_mask)
+        coords = self.coord_head(decoded_features)
+        pen_state_logit = self.pen_state_head(decoded_features).squeeze(-1)
         return coords, pen_state_logit
 
-
-class ImageDecoder(nn.Module):
-    """잠재 벡터로부터 UDF 이미지를 복원하는 Transposed CNN 기반 디코더 [cite: 183]"""
-    def __init__(self, out_channels=1, d_f=128):
+class UDFDecoder(nn.Module):
+    def __init__(self, embedding_dim: int, output_channels: int = 1, output_res: int = 64):
         super().__init__()
-        self.latent_proj = nn.Linear(d_f, 512 * 2 * 2)
-        # [cite_start]6개의 Transposed Convolutional Layer로 구성 [cite: 183]
+        self.start_dim = 4 # 4x4에서 업샘플링 시작
+        
+        self.fc = nn.Sequential(
+            nn.Linear(embedding_dim, 512 * self.start_dim * self.start_dim),
+            nn.ReLU(True)
+        )
+        
         self.decoder = nn.Sequential(
-            self._make_block(512, 512),       # 2x2 -> 4x4
-            self._make_block(512, 256),       # 4x4 -> 8x8
-            self._make_block(256, 128),       # 8x8 -> 16x16
-            self._make_block(128, 64),        # 16x16 -> 32x32
-            self._make_block(64, 32),         # 32x32 -> 64x64
-            nn.Conv2d(32, out_channels, kernel_size=3, padding=1),
-            nn.Sigmoid() # UDF 값은 0~1 사이
+            # Input: (B, 512, 4, 4)
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # -> (B, 256, 8, 8)
+            nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # -> (B, 128, 16, 16)
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # -> (B, 64, 32, 32)
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1), # -> (B, 1, 64, 64)
+            nn.Sigmoid() # UDF 값을 [0, 1] 범위로 출력
         )
 
-    def _make_block(self, in_c, out_c):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, z_f: torch.Tensor) -> torch.Tensor:
-        x = self.latent_proj(z_f) # (B, 512*2*2)
-        x = x.view(x.shape[0], 512, 2, 2) # (B, 512, 2, 2)
-        reconstructed_udf = self.decoder(x) # (B, 1, 64, 64)
-        return reconstructed_udf
-
-class StrokeUDFDecoder(nn.Module):
-    """Dual-Modal 디코더: 잠재 벡터로부터 Vector와 Image를 모두 복원"""
-    def __init__(self, vector_decoder, image_decoder):
-        super().__init__()
-        self.vector_decoder = vector_decoder
-        self.image_decoder = image_decoder
-
-    def forward(self, z_q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        recon_coords, recon_pen_logits = self.vector_decoder(z_q)
-        recon_udf = self.image_decoder(z_q)
-        return recon_coords, recon_pen_logits, recon_udf
-
-class StrokeFusionVQAE(nn.Module):
-    """StrokeFusion의 인코더와 디코더를 VQ-VAE 구조로 결합한 모델"""
-    def __init__(self, max_stroke_len=48, d_model=64, d_seq=32, d_img=64, d_f=128,
-                 num_embeddings=512, commitment_cost=0.25):
-        super().__init__()
-        # 인코더 부분
-        vec_enc = VectorEncoder(d_model=d_model, d_seq=d_seq)
-        img_enc = ImageEncoder(d_img=d_img)
-        self.encoder = StrokeUDFEncoder(vec_enc, img_enc, d_seq=d_seq, d_img=d_img, d_f=d_f)
-        
-        # 양자화 부분
-        self.quantizer = VectorQuantizer(num_embeddings, d_f, commitment_cost)
-        
-        # 디코더 부분
-        vec_dec = VectorDecoder(max_len=max_stroke_len, d_model=d_model, d_f=d_f)
-        img_dec = ImageDecoder(d_f=d_f)
-        self.decoder = StrokeUDFDecoder(vec_dec, img_dec)
-
-    def forward(self, stroke_seq: torch.Tensor, stroke_mask: torch.Tensor, udf_image: torch.Tensor) -> Tuple:
-        z_e = self.encoder(stroke_seq, stroke_mask, udf_image)
-        vq_loss, z_q, _ = self.quantizer(z_e)
-        recon_coords, recon_pen_logits, recon_udf = self.decoder(z_q)
-        return recon_coords, recon_pen_logits, recon_udf, vq_loss
-
-
-
-# --- 모델 테스트 ---
-if __name__ == '__main__':
-    BATCH_SIZE = 32
-    MAX_STROKE_LEN = 48
-    UDF_RESOLUTION = 64
-    D_MODEL = 64
-    D_SEQ = 32
-    D_IMG = 64
-    D_F = 128            # Encoder 출력 차원, Quantizer 코드북 벡터 차원
-    NUM_EMBEDDINGS = 256 # 코드북 크기 (K)
-
-    # 모델 초기화
-    model = StrokeFusionVQAE(
-        max_stroke_len=MAX_STROKE_LEN,
-        d_model=D_MODEL,
-        d_seq=D_SEQ,
-        d_img=D_IMG,
-        d_f=D_F,
-        num_embeddings=NUM_EMBEDDINGS
-    )
-
-    # 더미 입력 데이터 생성
-    dummy_stroke_seq = torch.rand(BATCH_SIZE, MAX_STROKE_LEN, 3)
-    dummy_stroke_mask = torch.ones(BATCH_SIZE, MAX_STROKE_LEN)
-    dummy_stroke_mask[0, 40:] = 0
-    dummy_stroke_mask[1, 30:] = 0
-    dummy_stroke_seq = dummy_stroke_seq * dummy_stroke_mask.unsqueeze(-1)
-    dummy_udf_image = torch.rand(BATCH_SIZE, 1, UDF_RESOLUTION, UDF_RESOLUTION)
-
-    # 모델 forward pass
-    recon_stroke, recon_udf, vq_loss = model(dummy_stroke_seq, dummy_stroke_mask, dummy_udf_image)
+    def forward(self, z_seq: torch.Tensor) -> torch.Tensor:
+        z_global = z_seq.mean(dim=1)
+        x = self.fc(z_global)
+        x = x.view(x.size(0), 512, self.start_dim, self.start_dim)
+        recon_udf = self.decoder(x)
+        return recon_udf
     
-    # 최종 학습 손실 계산 예시
-    recon_loss_stroke = F.mse_loss(recon_stroke, dummy_stroke_seq)
-    recon_loss_udf = F.mse_loss(recon_udf, dummy_udf_image)
-    total_loss = recon_loss_stroke + recon_loss_udf + vq_loss
+class StrokeTokenizerVQVAE(nn.Module):
+    """(수정) UDF 융합 기능이 포함된 최종 토크나이저"""
+    def __init__(self, max_stroke_len=32, d_model=256, d_seq=32, d_img=128, nhead=8, num_layers=6,
+                 num_embeddings=512, embedding_dim=256, commitment_cost=0.25):
+        super().__init__()
+        self.max_len = max_stroke_len
+        
+        self.vector_encoder = VectorEncoder(d_model=d_model, nhead=nhead, num_layers=num_layers, d_seq=d_seq)
+        self.image_encoder = ImageEncoder(d_img=d_img)
+        # self.fusion_encoder = FusionEncoder(d_model=d_model, d_img=d_img, embedding_dim=embedding_dim)
+        self.fusion_encoder = CrossAttentionFusion(
+            d_seq=d_seq,
+            d_img=d_img, 
+            embedding_dim=embedding_dim, 
+            nhead=nhead
+        )
+        self.quantizer = SequentialVectorQuantizer(num_embeddings, embedding_dim, commitment_cost) # (B, Np + 1, embedding_dim)
 
-    # 출력 Shape 확인
-    print("--- StrokeFusion VQ-VAE Test ---")
-    print(f"Input Stroke Sequence Shape: {dummy_stroke_seq.shape}")
-    print(f"Input UDF Image Shape:       {dummy_udf_image.shape}")
-    print("-" * 35)
-    print(f"Reconstructed Stroke Shape:  {recon_stroke.shape}")
-    print(f"Reconstructed UDF Shape:     {recon_udf.shape}")
-    print(f"VQ Loss (scalar):            {vq_loss.item():.4f}")
-    print(f"Total Loss (scalar):         {total_loss.item():.4f}")
+        self.decoder = VectorDecoderAR(d_model=d_model, nhead=nhead, num_layers=num_layers, embedding_dim=embedding_dim)
+        self.udf_decoder = UDFDecoder(embedding_dim=embedding_dim, output_res=64)
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal Trainable Parameters: {total_params:,}")
+
+    def forward(self, stroke_seq: torch.Tensor, stroke_mask: torch.Tensor, udf_image: torch.Tensor):
+        fused_seq, full_mask = self.encode_to_latents(stroke_seq, stroke_mask, udf_image)
+        vq_loss, quantized_seq, indices_seq = self.quantizer(fused_seq, full_mask)
+        
+        sos_token = torch.zeros(stroke_seq.shape[0], 1, 3, device=stroke_seq.device)
+        decoder_input = torch.cat([sos_token, stroke_seq[:, :-1, :]], dim=1)
+        print(decoder_input.shape)
+        recon_coords, recon_pen_logits = self.decoder(decoder_input, memory=quantized_seq, memory_padding_mask=(full_mask==0))
+
+
+        recon_udf = self.udf_decoder(quantized_seq)
+
+        
+        return recon_coords, recon_pen_logits, recon_udf, vq_loss, indices_seq
+
+
+    def encode_to_latents(self, stroke_seq: torch.Tensor, stroke_mask: torch.Tensor, udf_image: torch.Tensor) -> torch.Tensor:
+        """
+        (신규 헬퍼 메서드)
+        입력 데이터를 받아 양자화 직전의 융합된 잠재 벡터(fused_seq)를 반환합니다.
+        """
+        z_seq = self.vector_encoder(stroke_seq, stroke_mask)
+        z_img = self.image_encoder(udf_image)
+        batch_size = stroke_seq.shape[0]
+        full_mask = torch.cat([torch.ones(batch_size, 1, device=stroke_seq.device), stroke_mask], dim=1)
+
+        fused_seq = self.fusion_encoder(z_seq, z_img)
+        return fused_seq, full_mask
+
+    def initialize_codebook_with_kmeans(self, data_loader, device):
+        """
+        (신규 메인 메서드)
+        데이터로더의 일부 데이터를 사용해 K-Means로 코드북을 초기화합니다.
+        """
+        print("Initializing codebook with K-Means...")
+        
+        latent_vectors_list = []
+        masks_list = []
+        
+        self.eval() # 모델을 평가 모드로 설정
+        with torch.no_grad():
+            # 보통 5~10 배치 정도면 충분합니다.
+            for i, (stroke_seq, stroke_mask, udf_image) in enumerate(data_loader):
+                if i >= 10: break
+                
+                stroke_seq, stroke_mask, udf_image = stroke_seq.to(device), stroke_mask.to(device), udf_image.to(device)
+                
+                # `encode_to_latents`를 호출하여 잠재 벡터 추출
+                latent_vectors, full_mask = self.encode_to_latents(stroke_seq, stroke_mask, udf_image)
+                
+                latent_vectors_list.append(latent_vectors.cpu())
+                masks_list.append(stroke_mask.cpu())
+
+        all_latents = torch.cat(latent_vectors_list, dim=0)
+        all_masks = torch.cat(masks_list, dim=0)
+        
+        # 마스크를 사용해 유효한 잠재 벡터만 추출
+        B, Np, D = all_latents.shape
+        valid_indices = torch.where(all_masks.view(-1) == 1)[0]
+        valid_latents = all_latents.view(-1, D)[valid_indices]
+        valid_latents_np = valid_latents.numpy()
+        
+        print(f"Running K-Means on {valid_latents_np.shape[0]} valid latent vectors...")
+        
+        num_codes = self.quantizer.embedding.num_embeddings
+        kmeans = KMeans(n_clusters=num_codes, n_init='auto', random_state=0)
+        kmeans.fit(valid_latents_np)
+        
+        centroids = torch.from_numpy(kmeans.cluster_centers_).to(device, dtype=torch.float32)
+        
+        # 양자화기(quantizer)의 임베딩 가중치를 K-Means 결과로 덮어쓰기
+        with torch.no_grad():
+            self.quantizer.embedding.weight.copy_(centroids)
+            
+        self.train() # 모델을 다시 훈련 모드로 설정
+        print("K-Means initialization complete.")
+
+    @torch.no_grad()
+    def generate_from_indices(self, z_indices: torch.Tensor):
+        B, Np = z_indices.shape
+        device = z_indices.device
+        valid_z_indices = torch.clamp(z_indices, min=0) 
+
+        quantized_seq = self.quantizer.embedding(valid_z_indices)
+        # print('z_indices', z_indices[:2, :30])
+        print('quantized_seq: ', quantized_seq.shape, quantized_seq[0, :30, :5])
+        print('quantized_seq: ', quantized_seq.shape, quantized_seq[3, :30, :])
+        
+        # 2. 자기회귀 생성을 위한 <SOS> 토큰 초기화
+        generated_seq = torch.zeros(B, 1, 3, device=device)
+
+        for _ in range(Np):
+            coords, logits = self.decoder(generated_seq, memory=quantized_seq, memory_padding_mask=(z_indices == -1))
+            next_coord = coords[:, -1, :]
+            print('next-coord', next_coord[0])
+            next_logit = logits[:, -1]
+            next_pen = (torch.sigmoid(next_logit) > 0.2).float().unsqueeze(1)
+            
+            # print('next_pen: ', next_pen.shape, next_pen)
+            
+            next_point = torch.cat([next_coord, next_pen], dim=1).unsqueeze(1)
+            generated_seq = torch.cat([generated_seq, next_point], dim=1)
+            
+        return generated_seq[:, 1:, :] # <SOS> 토큰 제외
+
+
