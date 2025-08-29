@@ -28,9 +28,10 @@ class MixturePathGeneralizedKL(_Loss):
         reduction (str, optional): Specify the reduction to apply to the output ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction is applied to the output, ``'mean'``: the output is reduced by mean over sequence elements, ``'sum'``: the output is reduced by sum over sequence elements. Defaults to 'mean'.
     """
 
-    def __init__(self, path: MixtureDiscreteProbPath, reduction: str = "mean") -> None:
+    def __init__(self, path: MixtureDiscreteProbPath, reduction: str = "mean", padding_token_id: int = 0) -> None:
         super().__init__(None, None, reduction)
         self.path = path
+        self.padding_token_id = padding_token_id
 
     def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, t: Tensor) -> Tensor:
         r"""Evaluates the generalized KL loss.
@@ -56,7 +57,6 @@ class MixturePathGeneralizedKL(_Loss):
         log_p_1t_x1 = torch.gather(log_p_1t, dim=-1, index=x_1.unsqueeze(-1)) # (b, t, 1)
         log_p_1t_x1 = log_p_1t_x1.view(*x_1_shape) # (b, t): the probability of target token in each position i
 
-        # print(log_p_1t[0, :20, :20])
 
         # extract x_t value of p_{1|t}(x|x_t).
         p_1t = torch.exp(log_p_1t)
@@ -75,8 +75,18 @@ class MixturePathGeneralizedKL(_Loss):
         delta_x1_xt = (x_t == x_1).to(p_1t_xt.dtype)
         
 
-        valid_mask = (x_1 != 0).to(bool)
-        
+        # pad_mask = (x_1 != self.padding_token_id)
+        # non_pad_length = pad_mask.sum(dim=1)
+        # condition_lengths = non_pad_length // 2
+
+        ################# have to un comment to condition generation ###################
+        # indices = torch.arange(x_1.shape[1], device=x_1.device)
+        # condition_mask = indices.unsqueeze(0) < condition_lengths.unsqueeze(1)
+
+        # final_mask = pad_mask & (~condition_mask)
+        # final_mask = final_mask.to(bool) # 확실하게 bool 타입으로
+
+
         # maximize the (1-delta_x1_xt) * log_p_1t_x1
         # delta_x1_xt means that we want to minimize the p_{1|t}(x_t|x_1) when x_t is not equal to x_1
 
@@ -89,13 +99,19 @@ class MixturePathGeneralizedKL(_Loss):
         loss = -jump_coefficient * (
             p_1t_xt - delta_x1_xt + (1 - delta_x1_xt) * log_p_1t_x1
         )
+        
+        # print('loss.shape', loss.shape)
+        # print('loss', loss[0, :10])
+        # (256, 3072)
+        
 
-        loss = loss * valid_mask
+        # loss = loss * final_mask
 
         # loss = -((~delta_x1_xt & valid_mask) * log_p_1t_x1)
 
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1.0)
+            # return loss.sum() / final_mask.sum().clamp(min=1.0)
+            return torch.mean(loss)
         elif self.reduction == "sum":
             return torch.sum(loss)
         elif self.reduction == "none":

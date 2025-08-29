@@ -1,5 +1,5 @@
 
-out_dir = './output/sketch_apple_c_coupling'
+out_dir = './output/sketch_stroke'
 ckpt_path = './output/sketch_apple_c_coupling/2025-07-30-16-06-47_sketch_apple_c_coupling/current_ckpt.pt'
 data_dir = './data/full_sketch'
 

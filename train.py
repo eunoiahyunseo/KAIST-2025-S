@@ -181,7 +181,7 @@ class WrappedSamperModel(ModelWrapper):
 S = meta_vocab_size
 B = batch_size
 D = block_size
-coupling = 'C'
+coupling = 'nC' # not C (noting)
 
 if source_distribution == 'mask':
     x0 = torch.zeros((S)) + mask_token_id

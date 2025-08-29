@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from torch.nn import functional as F
+from einops import rearrange
 
 from flow_matching.path import MixtureDiscreteProbPath
 
@@ -143,6 +144,7 @@ class MixtureDiscreteEulerSolver(Solver):
         Raises:
             ImportError: To run in verbose mode, tqdm must be installed.
         """
+        # print(self.source_distribution_p)
         if not div_free == 0.0:
             assert (
                 self.source_distribution_p is not None
@@ -150,6 +152,11 @@ class MixtureDiscreteEulerSolver(Solver):
 
         # Initialize the current state `x_t` with the initial state `X_0`.
         time_grid = time_grid.to(device=x_init.device)
+        is_image = x_init.dim() == 4
+
+        if is_image:
+            B, C, H, W = x_init.shape
+            x_init = rearrange(x_init, 'b c h w -> b (c h w)')
 
         if step_size is None:
             # If step_size is None then set the t discretization to time_grid.
@@ -169,20 +176,10 @@ class MixtureDiscreteEulerSolver(Solver):
                 device=x_init.device,
             )
 
-            if return_intermediates:
-                # get order of intermediate steps:
-                order = torch.argsort(time_grid)
-                # Compute intermediate steps to return via nearest points in t_discretization to time_grid.
-                time_grid = get_nearest_times(
-                    time_grid=time_grid, t_discretization=t_discretization
-                )
 
         x_t = x_init.clone()
         steps_counter = 0
         res = []
-
-        if return_intermediates:
-            res = [x_init.clone()]
 
         if verbose:
             if not TQDM_AVAILABLE:
@@ -201,14 +198,24 @@ class MixtureDiscreteEulerSolver(Solver):
                 
                 t_batch = t.repeat(x_t.shape[0])
 
-                # Sample x_1 ~ p_1|t( \cdot |x_t)
-                p_1t_uncond = self.model(x_t=x_t, times=t_batch, **model_extras)
+                if is_image:
+                    # U-Net은 4D 입력을 기대하므로, 1D 시퀀스를 4D 이미지로 다시 변환합니다.
+                    model_input = rearrange(x_t, 'b (c h w) -> b c h w', c=C, h=H, w=W)
+                else:
+                    # 시퀀스 모델은 2D 입력을 그대로 사용합니다.
+                    model_input = x_t
+
+                # Sample x_1 ~ p_1|t( \cdot |x_t) # (B, S, V) <- softmax result
+                p_1t_uncond = self.model(x_t=model_input, times=t_batch, **model_extras)
+                # choose x_1 according to the categorical distribution
+                # (B, S)
                 x_1_uncond = categorical(p_1t_uncond.to(dtype=dtype_categorical))
 
                 scheduler_output = self.path.scheduler(t=t)
                 k_t, d_k_t = scheduler_output.alpha_t, scheduler_output.d_alpha_t
 
-                # (B, S, V)
+                # delta_1_uncond: (B, S, V)
+                # means probability velocity 
                 delta_1_uncond = F.one_hot(x_1_uncond, num_classes=self.vocabulary_size).to(k_t.dtype)
                 
                 epsilon = 1e-8
@@ -217,7 +224,7 @@ class MixtureDiscreteEulerSolver(Solver):
 
                 forward_coeff = d_k_t / one_minus_k_t_safe
                 # u의 각 요소 u(x_i)는 각 토큰이 x_i로 변하려는 순간적인 비율 (rate)를 의미한다.
-                u_uncond = forward_coeff * delta_1_uncond
+                u_uncond = forward_coeff * delta_1_uncond # 
                 u = u_uncond
 
                 # Checks if final step
@@ -230,25 +237,9 @@ class MixtureDiscreteEulerSolver(Solver):
 
                     if div_free_t > 0:
                         p_0 = self.source_distribution_p[(None,) * x_t.dim()]
-                        backward_related_coeff = d_k_t / (k_t_safe * one_minus_k_t_safe)
-                        backward_related_term = (one_minus_k_t_safe * p_0 + k_t_safe * delta_1_uncond)
-                        u = u + div_free_t * backward_related_coeff * backward_related_term
-
-                        # calculate h_adaptive
-                        max_effective_rate = (1.0 + div_free_t) * (d_k_t / one_minus_k_t_safe) + \
-                                            div_free_t * (d_k_t / k_t_safe)
-                
-                        max_effective_rate = max_effective_rate.clamp(min=epsilon)
-
-                        # Calculate adaptive step size
-                        h_adaptive = torch.min(h, 1.0 / max_effective_rate)
-
-                        current_h = h_adaptive
-                    else:
-                        max_effective_rate = one_minus_k_t_safe / d_k_t
-                        max_effective_rate = max_effective_rate.clamp(min=epsilon)
-                        h_adaptive = torch.min(h, 1.0 / max_effective_rate)
-                        current_h = h_adaptive
+                        u = u + div_free_t * d_k_t / (k_t * (1 - k_t)) * (
+                            (1 - k_t) * p_0 + k_t * delta_1_uncond
+                        )
 
                     # Set u_t(x_t|x_t,x_1) = 0
                     delta_t = F.one_hot(x_t, num_classes=self.vocabulary_size)
@@ -269,7 +260,7 @@ class MixtureDiscreteEulerSolver(Solver):
                     # 1 - exp(-\lambda h) 이다.
                     mask_jump = torch.rand(
                         size=x_t.shape, device=x_t.device
-                    ) < 1 - torch.exp(-current_h * intensity)
+                    ) < 1 - torch.exp(-h * intensity)
 
                     # when you decided to jump, then jump according to Q(x, y) / \lambda(x)
                     if mask_jump.sum() > 0:
@@ -278,7 +269,7 @@ class MixtureDiscreteEulerSolver(Solver):
                         )
 
                 steps_counter += 1
-                t = t + current_h
+                t = t + h
 
                 if return_intermediates and (t in time_grid):
                     res.append(x_t.clone())
@@ -288,10 +279,4 @@ class MixtureDiscreteEulerSolver(Solver):
                     ctx.refresh()
                     ctx.set_description(f"NFE: {steps_counter}")
 
-        if return_intermediates:
-            if step_size is None:
-                return torch.stack(res, dim=0)
-            else:
-                return torch.stack(res, dim=0)[order]
-        else:
-            return x_t
+        return x_t

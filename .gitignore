@@ -190,4 +190,9 @@ pyrightconfig.json
 wandb/
 output/
 out/
-.npz
+*.npz
+*.pt
+*.png
+*.pth
+*.ndjson
+*.gz
